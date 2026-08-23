@@ -101,14 +101,16 @@ all**. mppdb brings them together into one table that can be queried in seconds,
 which is the difference between a pipeline that can ask the question and one that
 cannot.
 
-That second clause is not hypothetical, and it makes this store a **preservation
-layer of last resort** as well as an analytics one. Two of the eleven `ssp` tables
-exist for no other reason: `source_nv_orphaned` holds 17,053 visits recovered from
-scratch FITS files after the nightlyValidation datasets were removed from both
-repositories, and `dia_source_2025lost` holds 70 observations reconstructed from an
-already-submitted ADES file that is itself now the only surviving copy of those
-measurements. §11 treats the consequence — those export directories are primary
-data, not a cache.
+That second clause is not hypothetical. Two of the eleven `ssp` tables exist
+because their upstream Butler datasets are gone: `source_nv_orphaned` holds 17,053
+visits recovered from scratch FITS files after the nightlyValidation datasets were
+removed from both repositories, and `dia_source_2025lost` holds 70 observations
+reconstructed from an already-submitted ADES file.
+
+**Those recovery inputs — the scratch FITS files and the ADES/PSV file — are the
+canonical copies of that data, and they are what require protection.** This
+database consolidates them into something queryable; it is not a substitute for
+keeping them. §11 treats the consequence.
 
 The same need recurs elsewhere, which is why the design is a general analytics
 database rather than an SSP-specific one. Three datasets are in scope:
@@ -119,12 +121,20 @@ database rather than an SSP-specific one. Three datasets are in scope:
 | `ppdb` | developing the SSP **daily data products** pipeline (see below) |
 | `dp2` *(planned)* | data-release analytics — DP2 products, loadable as soon as they exist |
 
-`ppdb`'s purpose is more specific than "prompt-processing analytics": it exists to
+`ppdb`'s purpose is more specific than "prompt-processing analytics": it is here to
 support **developing the SSP daily data products pipeline** — the pipeline that
 will produce the `sssource`, `ssobject` and `nearby_sso` tables for the Prompt
-Products Database. That development needs the existing PPDB content to work
-against and the `ssp` tables alongside it, which is precisely the case for having
-both in one queryable database rather than two disconnected exports.
+Products Database, developed separately at
+[`mjuric/ssp`](https://github.com/mjuric/ssp). That work needs the existing PPDB
+content to develop against and the `ssp` tables alongside it, which is the case for
+having both in one queryable database rather than two disconnected exports.
+
+:::{important}
+That pipeline **does not use this database yet**. `ppdb` is provisioned for it
+rather than consumed by it, so it currently has no active reader — worth knowing
+before drawing conclusions from its query load, or from its being static since
+2026-07-25.
+:::
 
 The two halves of the system serve two different purposes. The **ClickHouse
 backend** is the analytics engine: it is what makes a 40-billion-row table
@@ -259,14 +269,15 @@ only as the VO-standard tables (§6).
 **Not every consumer goes through TAP.** The SSP submission portal reads a single
 ClickHouse **view**, `ssp.SubmittableSources` — an eleven-branch `UNION` presenting
 all eleven tables under ten `collection` labels — and connects to ClickHouse
-*directly* rather than through this service. That view is deliberately **not in the
-registry and not advertised over TAP**: it exists only as ClickHouse metadata.
-Verified 2026-08-23: it is present in the database and absent from `/tables`.
+*directly* rather than through this service. That the view is **not currently in
+the registry, and so not advertised over TAP, is an oversight rather than a
+decision**; it is expected to be added. Verified 2026-08-23: present in the
+database, absent from `/tables`.
 
-Two consequences. A reader comparing `/tables` against the database will find this
-one extra object, and that is correct rather than drift. And the TAP service is not
-the only path to this data, so an outage of the service does not necessarily stop
-the pipeline that depends on the database.
+Two consequences meanwhile. A reader comparing `/tables` against the database will
+find this one extra object, which is a known omission and not catalog drift. And
+the TAP service is not the only path to this data, so an outage of the service does
+not necessarily stop the pipeline that depends on the database.
 
 The view also *screens* eligibility rather than exposing raw rows: on the three
 products carrying a `sky_source` column it drops sky-source rows and null
@@ -303,9 +314,9 @@ that still backs snapshot semantics.
 **`ppdb`** is a static import of the Rubin Prompt Products Database: a TAP dump of
 `data-int.lsst.cloud/api/ppdbtap` loaded with `mppdb ingest-tapdump`.
 ClickHouse-only — no lake, no manifests, no GC. It is here as development
-substrate for the SSP daily data products pipeline, which will write
-`sssource`, `ssobject` and `nearby_sso` back to the PPDB and which reads the
-`ssp` tables in the same database while doing so.
+substrate for the SSP daily data products pipeline (§2), which will write
+`sssource`, `ssobject` and `nearby_sso` back to the PPDB and read the `ssp` tables
+alongside — though that pipeline does not use this database yet.
 
 **`ssp`** is the solar-system working set: one table per export directory, each an
 `acid import butler --split-by visit` export of per-visit parquet parts with
@@ -681,11 +692,14 @@ An `--append` refuses
 Ordered by how much they should worry a new owner.
 
 1. **No durability story.** One node, one ClickHouse server, no replication, no
-   backups of 13.64 TiB. For most tables the source parquet is a de facto
-   backup — but `ssp.source_nv_orphaned` and `ssp.dia_source_2025lost` exist
-   nowhere else than their export directories on `/sdf`, and those directories
-   are irreplaceable primary data. Promotion requires a real backup commitment
-   for them specifically.
+   backups of 13.64 TiB. For most tables the source parquet is a de facto backup,
+   and the databases can be rebuilt from their exports. The exception is the two
+   recovered `ssp` products, whose Butler datasets no longer exist: their
+   canonical copies are the **scratch FITS files** and the **ADES/PSV file** those
+   tables were reconstructed from, with the parquet exports derived from them.
+   Those canonical inputs are irreplaceable and need an explicit protection
+   commitment — separately from, and more urgently than, a backup story for the
+   served databases.
 2. **The backend does not survive a host reboot unattended.** ClickHouse must be
    started by hand, in a documented order, including a tmpfs directory a reboot
    wipes. Until it is, every query fails — the service comes back on its own but
