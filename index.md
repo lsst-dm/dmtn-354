@@ -95,10 +95,20 @@ datasets are loaded and then queried.
 
 **The immediate driver is Solar System Processing.** SSP must know the set of all
 sources eligible to be linked into a newly discovered asteroid, or associated with
-an already-known one. Today those sources are scattered across dozens of separate
-repositories and collections; assembling them per query is impractical. mppdb
-brings them together into one table that can be queried in seconds — which is the
-difference between a pipeline that can ask the question and one that cannot.
+an already-known one. Those sources are scattered across dozens of separate
+repositories and collections — and in some cases **no longer exist upstream at
+all**. mppdb brings them together into one table that can be queried in seconds,
+which is the difference between a pipeline that can ask the question and one that
+cannot.
+
+That second clause is not hypothetical, and it makes this store a **preservation
+layer of last resort** as well as an analytics one. Two of the eleven `ssp` tables
+exist for no other reason: `source_nv_orphaned` holds 17,053 visits recovered from
+scratch FITS files after the nightlyValidation datasets were removed from both
+repositories, and `dia_source_2025lost` holds 70 observations reconstructed from an
+already-submitted ADES file that is itself now the only surviving copy of those
+measurements. §11 treats the consequence — those export directories are primary
+data, not a cache.
 
 The same need recurs elsewhere, which is why the design is a general analytics
 database rather than an SSP-specific one. Three datasets are in scope:
@@ -212,9 +222,14 @@ and neither is a defect.
 | `mppdb.DiaSource`, `DiaObject`, `DiaObjectLast`, `DiaForcedSource`, `SSSource`; all three `ppdb` tables | `hpix29` (spatial) | cone searches — a `CONTAINS(POINT(...), CIRCLE(...))` becomes a HEALPix range scan | large id-ordered sweeps |
 | every `ssp` table | `sourceId` / `diaSourceId` / `id` | lookups and joins by source id, and by visit — visit is packed into the high bits of the id, so a visit is a contiguous range | cone searches, which scan the table |
 
-**Why `ssp` is id-sorted and not spatial.** Because that is what Solar System
-Processing asks of it: give me these sources, by identifier, for these visits —
-the access pattern of the SSP submission tooling that consumes them.
+**Why `ssp` is id-sorted and not spatial.** Because that is what its principal
+consumer asks of it. The SSP submission tooling has essentially one query shape:
+a batch of 10⁴–10⁶ `(collection, id)` pairs is staged in a session temporary table
+and joined server-side, selecting a fixed 19-column projection — one insert and one
+join per batch, deliberately never an `IN` list. Its only whole-table work is
+offline verification, which proceeds visit by visit, and the same id ordering
+serves that too because visit is packed into the id's high bits. There is no
+spatial predicate anywhere in that tooling, and nothing planned needs one.
 That access pattern is a range scan on the sort key, which is the fastest thing
 this engine does. A spatial ordering would serve cone searches instead and would
 not help SSP at all. The spatial columns (`hpix29` and unit vectors) are still
@@ -226,9 +241,10 @@ This is a per-dataset decision that can change. ClickHouse supports **projection
 access patterns can have both, at the cost of storage and ingest time. Today
 `ssp` has none because nothing needs them yet; the `mppdb` and `ppdb` tables are
 spatially sorted because their use is positional; and `dp2`, when it lands, is
-expected to be spatial. If an SSP use case starts needing cone searches at
-interactive speed, adding a spatial projection is the intended answer rather than
-a redesign.
+expected to be spatial. If a use case starts needing cone searches over `ssp` at
+interactive speed, adding a spatial projection is the intended answer rather than a
+redesign. Note that the "nothing needs them" holds for the submission tooling,
+which was checked; it is not a statement about the SSP pipeline as a whole.
 
 Practically: use `TOP` while exploring, and prefer `/async` (a UWS job) over
 `/sync` for anything that might be slow — async results are spooled and survive a
@@ -238,6 +254,25 @@ The pruning works because each table's registry carries a `physical` block bindi
 `ra`/`dec` to an `hpix29` column and unit vectors, which the query planner turns
 into HEALPix ranges. That block is why the catalog is kept as documents and not
 only as the VO-standard tables (§6).
+
+:::{important}
+**Not every consumer goes through TAP.** The SSP submission portal reads a single
+ClickHouse **view**, `ssp.SubmittableSources` — an eleven-branch `UNION` presenting
+all eleven tables under ten `collection` labels — and connects to ClickHouse
+*directly* rather than through this service. That view is deliberately **not in the
+registry and not advertised over TAP**: it exists only as ClickHouse metadata.
+Verified 2026-08-23: it is present in the database and absent from `/tables`.
+
+Two consequences. A reader comparing `/tables` against the database will find this
+one extra object, and that is correct rather than drift. And the TAP service is not
+the only path to this data, so an outage of the service does not necessarily stop
+the pipeline that depends on the database.
+
+The view also *screens* eligibility rather than exposing raw rows: on the three
+products carrying a `sky_source` column it drops sky-source rows and null
+positions. "Eligible source" is therefore a filtered notion, not simply
+"everything in the table".
+:::
 
 ## The data
 
@@ -321,24 +356,65 @@ enough to state with measurements rather than adjectives.
 A dataset of tens of billions of rows and tens of terabytes has to land in hours,
 not weeks — and then be *extended* without reloading. Both hold today.
 
+A dataset's journey has two stages — Butler repository to an export, then export
+into ClickHouse — and both were measured on this hardware.
+
 | stage | measured |
 |---|---|
-| parquet exports → ClickHouse (`ingest-parquet`, 64 workers) | **~200 M rows/min**, bounded by WekaFS read bandwidth rather than by ClickHouse |
-| the full `ssp` rebuild (93.76 B rows, 11.05 TiB) | ≈ 8 hours of load time at that rate |
-| incremental append | only the new per-visit parts are read; cost is proportional to what arrived, not to table size |
+| Butler → HATS export (`acid import butler`, DP2, 2026-08-23) | **91.44 G rows / 13.78 TB in 7.0 h wall**, across six 128-core hosts running one dataset each |
+| export → ClickHouse (`ingest-parquet`, 64 workers, one host) | **~200 M rows/min**, bounded by WekaFS read bandwidth rather than by ClickHouse |
+| the full `ssp` rebuild (93.76 B rows, 11.05 TiB) | ≈ 8 h of load time at that rate |
 
-The incremental path is what makes the database sustainable rather than a
-one-off: an append reads the immutable per-part manifests, loads only parts not
-already recorded in the provenance ledger, and refuses rather than guesses if the
-ledger cannot account for the table. Loading is therefore a nightly operation, not
-a migration.
+So a release-scale dataset moves from Butler to a queryable table in **hours at each
+stage** on comparable hardware. That is the claim worth making; a *rate* comparison
+between the two stages would be misleading, for two reasons worth stating because
+they will trip up the next person to measure this:
+
+- **Per-host rates differ by about 6x.** The export's 217 M rows/min aggregate is
+  six hosts; per host it is ~36 M rows/min against the load step's ~200 M on one.
+  The export also does strictly more work — read artifacts, shard, spill, read the
+  spill back, spatially sort, write partitions, build a margin cache — with one
+  product pushing 8.8 TB through the shuffle before writing 9.76 TB.
+- **Rows per minute is the wrong unit upstream.** Across the DP2 products it varies
+  **60x** (5.8–352 M rows/min), almost entirely with row *width*: one table is 1,225
+  columns wide, another 29. Byte rate over the same products varies only ~4x
+  (5.8–23.3 GB/min), so **GB/min is the honest upstream unit**. Two products bracket
+  the behaviour: `object_forced_source` at 44.7 G rows / 912 GB in 127 min (the
+  many-rows case) and `source` at 17.6 G rows / 9.76 TB in 419 min (the many-bytes
+  case).
+
+**Incrementality holds at both stages, and this is what makes the system
+sustainable rather than a one-off.** Downstream, an append reads the immutable
+per-part manifests, loads only parts not already in the provenance ledger, and
+refuses rather than guesses if the ledger cannot account for the table. Upstream,
+the flat per-visit exports work the same way: a no-op nightly run over a
+70,946-group product takes **24 seconds**, and a real append of 940,680 refs /
+118.5 M rows takes about **9 minutes**. Bulk in hours, nightly extension in
+seconds to minutes, at both layers.
 
 :::{important}
-**Not yet measured here:** the upstream conversion times — Butler repository to
-parquet or HATS export — which are the other half of a dataset's journey and are
-performed by separate tooling. They should be added; the figures above cover only
-the export→database stage.
+**HATS exports are one-off per release, not incremental.** There is no append mode
+for a HATS collection — it is all-or-nothing, so re-importing is a full rebuild.
+The 7 hours above is the cost of a *release*, not of a night. Only the flat
+per-visit exports have the incremental path.
 :::
+
+**Where the time goes** — offered as informed inference, not as a profile, since
+the export was not instrumented. The bulk case is WekaFS-bandwidth-bound, the same
+constraint as the load step. The many-small-artifacts case is instead
+registry-latency-bound: one product needed 92 minutes for a fifth of another's
+bytes because it was 183,169 datastore artifacts, one registry query each. That
+second effect is upstream-only and has no analogue on the ClickHouse side. Very
+wide tables are CPU- and writer-memory-bound.
+
+These figures come from a single day's run with a warm-ish filesystem, six
+concurrent imports contending for one WekaFS namespace, and partitioning
+parameters inherited rather than tuned; a dedicated run on a quiet filesystem
+would be faster by an unmeasured margin. Every row count matched an independent
+earlier import of the same collection exactly, and all thirteen products succeeded
+on the first attempt. Per-catalog `acid-import-log.yaml` files under the DP2
+export directory record each run's arguments, worker counts, totals and elapsed
+time, and travel with the data.
 
 ### Queries must return quickly at that scale
 
