@@ -106,8 +106,15 @@ database rather than an SSP-specific one. Three datasets are in scope:
 | database | supports |
 |---|---|
 | `ssp` | Solar System Processing — the eligible-source working set |
-| `ppdb` | prompt-processing analytics (the Prompt Products Database) |
+| `ppdb` | developing the SSP **daily data products** pipeline (see below) |
 | `dp2` *(planned)* | data-release analytics — DP2 products, loadable as soon as they exist |
+
+`ppdb`'s purpose is more specific than "prompt-processing analytics": it exists to
+support **developing the SSP daily data products pipeline** — the pipeline that
+will produce the `sssource`, `ssobject` and `nearby_sso` tables for the Prompt
+Products Database. That development needs the existing PPDB content to work
+against and the `ssp` tables alongside it, which is precisely the case for having
+both in one queryable database rather than two disconnected exports.
 
 The two halves of the system serve two different purposes. The **ClickHouse
 backend** is the analytics engine: it is what makes a 40-billion-row table
@@ -206,7 +213,8 @@ and neither is a defect.
 | every `ssp` table | `sourceId` / `diaSourceId` / `id` | lookups and joins by source id, and by visit — visit is packed into the high bits of the id, so a visit is a contiguous range | cone searches, which scan the table |
 
 **Why `ssp` is id-sorted and not spatial.** Because that is what Solar System
-Processing asks of it: give me these sources, by identifier, for these visits.
+Processing asks of it: give me these sources, by identifier, for these visits —
+the access pattern of the SSP submission tooling that consumes them.
 That access pattern is a range scan on the sort key, which is the fastest thing
 this engine does. A spatial ordering would serve cone searches instead and would
 not help SSP at all. The spatial columns (`hpix29` and unit vectors) are still
@@ -259,7 +267,10 @@ that still backs snapshot semantics.
 
 **`ppdb`** is a static import of the Rubin Prompt Products Database: a TAP dump of
 `data-int.lsst.cloud/api/ppdbtap` loaded with `mppdb ingest-tapdump`.
-ClickHouse-only — no lake, no manifests, no GC.
+ClickHouse-only — no lake, no manifests, no GC. It is here as development
+substrate for the SSP daily data products pipeline, which will write
+`sssource`, `ssobject` and `nearby_sso` back to the PPDB and which reads the
+`ssp` tables in the same database while doing so.
 
 **`ssp`** is the solar-system working set: one table per export directory, each an
 `acid import butler --split-by visit` export of per-visit parquet parts with
