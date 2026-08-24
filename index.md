@@ -1,195 +1,224 @@
-# The mppdb Database Service at the USDF
+# mppdb: SQL and TAP Analytics for Rubin Catalogs at the USDF
 
 ```{abstract}
-mppdb is a large-scale SQL analytics database for Rubin catalog-level data, with
-a TAP 1.1 service in front of it: some 120 billion rows across three databases on
-a single ClickHouse server at the USDF, queryable in ADQL from ordinary VO tools.
-It exists because Rubin produces catalog datasets faster than it acquires places
-to analyse them — most immediately for Solar System Processing, which needs every
-eligible source in one queryable table rather than scattered across dozens of
-repositories. This note describes the system as
-deployed: what it serves and where the data comes from, how to query it, how the
-service is deployed on the Rubin Science Platform, how an operator keeps it
-running, and what promotion to production would require. It is written for the people who will operate the
-service and for the people who will use it.
+mppdb is a SQL analytics database for Rubin catalog data, with a TAP 1.1 service
+in front of it. It holds about 120 billion rows across three databases on one
+ClickHouse server at the USDF, and you query it in ADQL from TOPCAT, pyvo, or its
+own web console. It exists because Rubin produces catalog datasets faster than it
+gains places to analyse them. The first half of this note is for people using the
+service; the second half is for people running it.
 ```
 
 ## Scope and status
 
-This note covers **the whole mppdb deployment at the USDF**, which has two
-distinct parts:
+The service runs at <https://usdf-rsp-dev.slac.stanford.edu/mppdb>. Anyone who can
+log in to `usdf-rsp-dev` can query it.
 
-- a **backend** on `sdfiana035` — the ClickHouse server holding the data, the
-  ingest pipeline that loads it, and the catalog store that describes it. This
-  runs inside an apptainer sandbox on a Rubin dev node and is where all writes
-  happen.
-- the **service**: the `mppdb` Phalanx application at
-  <https://usdf-rsp-dev.slac.stanford.edu/mppdb>, a front-end-only deployment on
-  the `usdf-rsp-dev` Rubin Science Platform. It queries the backend read-only and
-  owns no data of its own.
+It is a pilot. It runs on one node, has no replication and no backups, and does
+not come back on its own after a host reboot. It is in real use anyway. This note
+describes what is deployed, not what is planned.
 
-**Why the split exists — it is a workaround, not a design.** The service belongs
-on Phalanx because that is where the platform supplies what a user-facing service
-needs: Gafaelfawr authentication and RSP identity, container build and lifecycle
-management, ingress and TLS, secret management, and a deployment path with review
-and rollback. The backend cannot follow it there, because the *data path* would
-not survive the move. WekaFS is presented to this Kubernetes environment over
-**NFS**, and NFS performance in that environment is far too poor to carry a
-multi-terabyte ClickHouse server. So the backend runs where WekaFS is mounted
-natively — a general-purpose interactive node — and the Kubernetes front-end
-reaches it over the network.
+**Part I — Using the service** (§2–§7) covers what is in the database and how to
+query it. **Part II — Operations and internals** (§8–§17) covers how it is built,
+how to run it, and what would have to change for production.
 
 :::{important}
-**The ideal deployment is one containerized application** managed by Argo CD under
-Phalanx, exactly as the service half already is — server, ingest and service
-together, with no node to keep by hand. What blocks it is filesystem performance
-in the Kubernetes environment, nothing about mppdb itself. If that data path ever
-becomes performant, collapsing the two halves is the right end state; §12 lists
-it. Until then, the node is load-bearing and should not be "tidied away" into the
-cluster.
-:::
-
-The split matters because the two are operated differently and by different
-means: the backend is a working tree and command-line tooling on a node, the
-service is a Helm chart and an Argo CD application. **The unit of operation
-between them is the catalog**: a publish on the backend changes what the service
-should serve, and the service picks that up only when reloaded (§9).
-
-What belongs to the service alone is its account universe — users, sessions, API
-tokens, quotas and async-job state live in its own `state.db`. Nothing about
-those is shared with the backend or with any future second front-end; they are
-per-instance state by design.
-
-Two properties are what make the system useful rather than merely present, and
-both are demonstrated rather than asserted: datasets of tens of billions of rows
-load in hours and can be **extended incrementally**, and queries against them
-return in seconds **when the query matches how the dataset is ordered**. Both are
-quantified later.
-
-The system is a **pilot**. The backend runs on one node with no replication and
-no backups, and does not survive a host reboot unattended. It is nonetheless in
-real use, and the sections below describe what is deployed rather than what is
-intended.
-
-:::{important}
-**Current status** callouts like this one mark something provisional, missing, or
-known to be wrong. Believe the callout over the surrounding text.
+**Current status** boxes like this one flag something provisional or known to be
+wrong. Believe the box over the surrounding text.
 :::
 
 :::{warning}
-**Numbers age quickly.** Row counts and table lists in this note were measured on
-2026-08-23. The `ssp` database grew from ~22 billion to ~94 billion rows in the
-six days before that date. Re-query rather than trusting a figure here; §9 says
-how.
+Row counts here were measured on 2026-08-23. The `ssp` database grew from 22 to 94
+billion rows in the six days before that. Re-query rather than trusting a number
+in this note; §13 shows how.
 :::
 
-## What the system is, and why it exists
+# Part I — Using the service
 
-Rubin generates substantial **catalog-level** datasets — prompt-processing
-products, preliminary data releases, per-visit source tables — and has no
-performant place to run analytics over them. They live as Butler collections and
-file exports, which is right for pipeline processing and wrong for the question
-"give me all the rows matching this, across everything, now". mppdb is that place:
-a central, internal, large-scale SQL analytics database into which tabular
-datasets are loaded and then queried.
+## What mppdb is for
 
-**The immediate driver is Solar System Processing.** SSP must know the set of all
-sources eligible to be linked into a newly discovered asteroid, or associated with
-an already-known one. Those sources are scattered across dozens of separate
-repositories and collections — and in some cases **no longer exist upstream at
-all**. mppdb brings them together into one table that can be queried in seconds,
-which is the difference between a pipeline that can ask the question and one that
-cannot.
+Rubin produces large catalog datasets — prompt-processing products, preliminary
+data releases, per-visit source tables. They live in Butler collections and file
+exports. That works for pipelines and not for questions like "give me every row
+matching this, across everything, now". mppdb answers those questions.
 
-That second clause is not hypothetical. Two of the eleven `ssp` tables exist
-because their upstream Butler datasets are gone: `source_nv_orphaned` holds 17,053
-visits recovered from scratch FITS files after the nightlyValidation datasets were
-removed from both repositories, and `dia_source_2025lost` holds 70 observations
-reconstructed from an already-submitted ADES file.
+The immediate reason it exists is Solar System Processing. SSP needs the set of
+all sources that could be linked into a new asteroid discovery, or associated with
+a known one. Those sources sit in dozens of separate repositories and collections,
+and some no longer exist upstream at all. mppdb puts them in one table you can
+query in seconds.
 
-**Those recovery inputs — the scratch FITS files and the ADES/PSV file — are the
-canonical copies of that data, and they are what require protection.** This
-database consolidates them into something queryable; it is not a substitute for
-keeping them. §11 treats the consequence.
+Two of the `ssp` tables are recoveries: `source_nv_orphaned` holds 17,053 visits
+rebuilt from scratch FITS files after the nightlyValidation datasets were deleted
+from both repositories, and `dia_source_2025lost` holds 70 observations rebuilt
+from a submitted ADES file. The FITS files and that PSV file remain the canonical
+copies and need protecting (§16); mppdb makes them queryable, it does not replace
+them.
 
-The same need recurs elsewhere, which is why the design is a general analytics
-database rather than an SSP-specific one. Three datasets are in scope:
+The same need shows up elsewhere, so the database is general rather than
+SSP-specific. Three datasets are in scope:
 
-| database | supports |
+| database | what it is for |
 |---|---|
 | `ssp` | Solar System Processing — the eligible-source working set |
-| `ppdb` | developing the SSP **daily data products** pipeline (see below) |
-| `dp2` *(planned)* | data-release analytics — DP2 products, loadable as soon as they exist |
+| `ppdb` | developing the SSP daily data products pipeline |
+| `dp2` *(planned)* | data-release analytics, loadable as soon as DP2 exists |
 
-`ppdb`'s purpose is more specific than "prompt-processing analytics": it is here to
-support **developing the SSP daily data products pipeline** — the pipeline that
-will produce the `sssource`, `ssobject` and `nearby_sso` tables for the Prompt
-Products Database, developed separately at
-[`mjuric/ssp`](https://github.com/mjuric/ssp). That work needs the existing PPDB
-content to develop against and the `ssp` tables alongside it, which is the case for
-having both in one queryable database rather than two disconnected exports.
+`ppdb` is there to support the pipeline that will produce `sssource`, `ssobject`
+and `nearby_sso` for the Prompt Products Database, developed at
+[`mjuric/ssp`](https://github.com/mjuric/ssp). That pipeline does not use this
+database yet, so `ppdb` currently has no active reader.
 
-:::{important}
-That pipeline **does not use this database yet**. `ppdb` is provisioned for it
-rather than consumed by it, so it currently has no active reader — worth knowing
-before drawing conclusions from its query load, or from its being static since
-2026-07-25.
-:::
+**The service on top does two things.** It provides a **TAP 1.1 interface**, so
+applications and standard VO tools query the database without anything bespoke.
+And it provides a **web console** for exploring what is in the database — write a
+query, see the table, draw a plot — which is how you find out what these datasets
+actually contain without writing a program.
 
-The two halves of the system serve two different purposes. The **ClickHouse
-backend** is the analytics engine: it is what makes a 40-billion-row table
-queryable at all. The **service** puts a *standard* interface on top — TAP, so
-that applications and existing VO tools can query it without bespoke clients —
-and a web console on top of that, so a human can write a query, see a plot, and
-get a sense of what is actually in these datasets without writing any code.
+## Getting started
 
-```{mermaid}
-flowchart TB
-  subgraph BACKEND["backend · sdfiana035 · apptainer sandbox"]
-    ING["ingest: parquet / HATS / tapdump<br/>publishes data, then catalog"]
-    CH[("ClickHouse 26.6<br/>mppdb · ppdb · ssp<br/>TAP_SCHEMA + registries")]
-    ING --> CH
-  end
-  SVC["mppdb Phalanx app · usdf-rsp-dev<br/>/mppdb"]
-  U["users: browser console · TOPCAT · pyvo"]
-  CH -- "read-only, mppdb_ro" --> SVC
-  SVC --> U
+Open <https://usdf-rsp-dev.slac.stanford.edu/mppdb/ui/>. Rubin SSO logs you in;
+your account is created on first visit. There is no signup and no password held by
+the service.
+
+**Start with the demo notebook.** Every account gets one, called *Demo:
+Sky/Visit/Light Curve*. It is the fastest way to see what the service does: sixteen
+cells that begin with the whole sky, sort down to one active object, pull its light
+curve, and then plot every detection from a single visit. It also shows the feature
+that makes these notebooks more than a query box — `{{ }}` references, which feed a
+value from one cell's results into the next cell's query, so a chain of queries
+reads like an argument instead of a series of copy-pastes.
+
+The console also has a query editor, a schema browser listing every table with its
+row count, and worked examples you can run and edit: a cone search, per-band
+detection counts, light curves, solar-system objects, and MPC orbital elements.
+
+Notebooks here speak ADQL rather than Python. Cells run top to bottom and remember
+what came before, and you can add plot cells and markdown cells alongside the
+queries.
+
+For scripted access you need a token. Mint one in the RSP token page
+(`/settings/tokens/new`, scope `read:tap` only) and save it:
+
+```
+(umask 077; cat > ~/.mppdb.token)   # paste the token, press Enter, then Ctrl-D
 ```
 
-All writes happen on the backend node; the service only ever reads. That
-asymmetry is what lets the service be redeployed, restarted or rolled back
-without any risk to the data.
+That writes `~/.mppdb.token` readable only by you, and keeps the token out of your
+shell history.
 
-## Querying the service
+## What is in the database
 
-### Endpoints
+Measured 2026-08-23:
 
-| | |
+| database | tables | rows | on disk |
+|---|---|---|---|
+| `ssp` | 11 | 93.77 B | 11.05 TiB |
+| `mppdb` | 12 | 25.74 B | 2.57 TiB |
+| `ppdb` | 3 | 48.70 M | 9.29 GiB |
+
+`mppdb` holds DP2 prompt products: `DiaSource`, `DiaObject`, `DiaObjectLast`,
+`DiaForcedSource`, `SSObject`, `SSSource`, `mpc_orbits` and related tables, with
+Felis datatypes, units and descriptions. `ppdb` holds the three PPDB tables.
+`ssp` holds per-visit source catalogs, one table per export — the four largest
+are `source_daytime` (43.54 B rows), `source_dp2` (20.66 B), `source_nv`
+(17.99 B) and `source_nv_orphaned` (9.17 B).
+
+The console's schema browser is the fastest way to see columns, units and
+descriptions. `SELECT * FROM TAP_SCHEMA.tables` gives the same thing in SQL.
+
+## Writing queries
+
+**Qualify table names.** Write `mppdb.DiaSource`, `ssp.source_nv`,
+`ppdb.DiaObject`. Only the default database resolves unqualified names, so
+qualifying always works.
+
+**Use `TOP` while exploring**, and prefer async for anything that might be slow.
+A sync query returns in the request; an async one becomes a job whose results are
+spooled and survive a disconnect. In pyvo that is `run_async` instead of `search`.
+
+### What is fast, and why it differs per table
+
+Each table is physically sorted on one key. A query is fast when its filter
+matches that key, because the engine reads a slice instead of the whole table. The
+key is chosen per dataset to match how that dataset is used.
+
+| tables | sorted on | fast | slow |
+|---|---|---|---|
+| `mppdb.DiaSource`, `DiaObject`, `DiaObjectLast`, `DiaForcedSource`, `SSSource`; all `ppdb` tables | `hpix29` (position) | cone searches | large sweeps by id |
+| all `ssp` tables | `sourceId` / `diaSourceId` / `id` | lookups by id, and by visit — visit sits in the id's high bits, so one visit is one contiguous range | cone searches |
+
+Measured against the live service:
+
+| query | time |
 |---|---|
-| Base URL | `https://usdf-rsp-dev.slac.stanford.edu/mppdb` |
-| Web console | `/mppdb/ui/` |
-| TAP sync / async | `/mppdb/sync`, `/mppdb/async` |
-| Catalog state | `/mppdb/catalog` |
-| Authentication | Rubin SSO via Gafaelfawr, scope `read:tap` |
+| cone search, `mppdb.DiaObjectLast`, radius 0.5°, 1000 rows | **0.2 s** |
+| `COUNT(*)` on `ssp.source_nv` (17.99 B rows) | **0.2 s** |
+| id-ordered lookup, `ssp.dia_source_dp1` | **0.1 s** |
+| `GROUP BY band` with `AVG(snr)` over `mppdb.DiaSource` | **11.9 s** |
 
-`/tables`, `/capabilities`, `/availability` and `/catalog` are unauthenticated on
-both; everything else needs a credential.
+A cone search on an `ssp` table is a different matter: the spatial columns exist,
+so the query is correct, but nothing prunes it and the engine scans the table.
+Expect minutes on tens of billions of rows.
 
-### Credentials
+`ssp` is sorted by id because that is what its main user asks for. The SSP
+submission tooling sends batches of 10⁴–10⁶ `(collection, id)` pairs, joins them
+server-side against a staged temporary table, and selects 19 columns. Its only
+whole-table work is offline verification, which goes visit by visit — served by
+the same ordering. It issues no spatial queries.
 
-Rubin SSO authenticates you at the ingress, and mppdb provisions your account on
-first sight — there is no separate signup and no password held by the service. For
-external VO tools, mint an RSP token (`/settings/tokens/new`, scope `read:tap`
-only) and keep it in a file:
+This can change. ClickHouse supports projections, a second physical ordering of
+the same table, so a dataset that needs both patterns can have both at the cost of
+storage and ingest time. Nothing needs one today. If a use case starts needing
+fast cone searches over `ssp`, a projection is the answer rather than a redesign.
 
+### Examples
+
+A cone search — fast, because `mppdb.DiaObjectLast` is spatially sorted:
+
+```sql
+SELECT TOP 1000 diaObjectId, ra, dec, nDiaSources, lastDiaSourceMjdTai
+FROM mppdb.DiaObjectLast
+WHERE CONTAINS(POINT('ICRS', ra, dec),
+               CIRCLE('ICRS', 53.13, -28.10, 0.5)) = 1
 ```
-(umask 077; cat > ~/.mppdb.token)   # paste the token, Enter, then Ctrl-D
+
+Detections per band, with mean signal-to-noise — a full aggregate, 11.9 s:
+
+```sql
+SELECT band, COUNT(*) AS n_detections, AVG(snr) AS mean_snr
+FROM mppdb.DiaSource
+GROUP BY band
+ORDER BY band
 ```
 
-That writes `~/.mppdb.token` mode 600 and keeps the token out of shell history.
-The token is the credential for TOPCAT and pyvo alike.
+A forced-photometry light curve for one object:
 
-### pyvo
+```sql
+SELECT midpointMjdTai, band, psfFlux, psfFluxErr
+FROM mppdb.DiaForcedSource
+WHERE diaObjectId = 744858242361853537
+ORDER BY midpointMjdTai
+```
+
+Main-belt orbits from the MPC elements table:
+
+```sql
+SELECT TOP 1000 designation, a, q, e, i, argperi, node, epoch_mjd
+FROM mppdb.mpc_orbits
+WHERE a BETWEEN 2.1 AND 3.3 AND e < 0.25
+```
+
+The console ships these and others, ready to run.
+
+## TOPCAT and pyvo
+
+The TAP endpoint is `https://usdf-rsp-dev.slac.stanford.edu/mppdb`.
+
+In **TOPCAT**, enter that as the TAP URL. For authentication use your token as the
+HTTP Basic *username* with `x-oauth-basic` as the password.
+
+In **pyvo**:
 
 ```python
 import pyvo, requests
@@ -207,341 +236,254 @@ job = service.run_async("SELECT TOP 10 * FROM ssp.dia_source_dp1")
 print(job.to_table())
 ```
 
-In TOPCAT, use the base URL above as the TAP URL, and the token as the HTTP Basic
-**username** with `x-oauth-basic` as the password (Gafaelfawr's convention, which
-the ingress accepts; `Bearer` works too).
+## Things to know
 
-### Writing ADQL against this service
+**Your account is local to this service.** Users, sessions, tokens, quotas and job
+history live in this deployment. A token minted here works here.
 
-**Qualify every table name.** A table is addressed as `database.table` —
-`ssp.dia_source_dp1`, `mppdb.DiaSource`, `ppdb.DiaObject`. Only the configured
-default database resolves unqualified names, so qualifying always works and is
-the habit to keep.
+**One table is missing from TAP.** `ssp.SubmittableSources` is a view over all
+eleven `ssp` tables, used by the SSP submission portal, which reads ClickHouse
+directly. It is absent from `/tables` by oversight rather than by design and is
+expected to be added. If you compare `/tables` against the database and find one
+extra object, that is why.
 
-### What a query can prune on — and why it differs per dataset
+**Async jobs and results are per-user**, with quotas on concurrency and spool
+space. The console shows your jobs.
 
-This is the one thing worth understanding before writing a query here. Every table
-is physically **sorted** on a key, and ClickHouse answers a query quickly when the
-query's filter matches that key: it reads the relevant slice instead of the table.
-The key is chosen per dataset, to match how that dataset is actually used — so the
-same ADQL can be interactive against one database and a full scan against another,
-and neither is a defect.
+# Part II — Operations and internals
 
-| tables | sorted on | fast | slow |
-|---|---|---|---|
-| `mppdb.DiaSource`, `DiaObject`, `DiaObjectLast`, `DiaForcedSource`, `SSSource`; all three `ppdb` tables | `hpix29` (spatial) | cone searches — a `CONTAINS(POINT(...), CIRCLE(...))` becomes a HEALPix range scan | large id-ordered sweeps |
-| every `ssp` table | `sourceId` / `diaSourceId` / `id` | lookups and joins by source id, and by visit — visit is packed into the high bits of the id, so a visit is a contiguous range | cone searches, which scan the table |
+## Architecture
 
-**Why `ssp` is id-sorted and not spatial.** Because that is what its principal
-consumer asks of it. The SSP submission tooling has essentially one query shape:
-a batch of 10⁴–10⁶ `(collection, id)` pairs is staged in a session temporary table
-and joined server-side, selecting a fixed 19-column projection — one insert and one
-join per batch, deliberately never an `IN` list. Its only whole-table work is
-offline verification, which proceeds visit by visit, and the same id ordering
-serves that too because visit is packed into the id's high bits. There is no
-spatial predicate anywhere in that tooling, and nothing planned needs one.
-That access pattern is a range scan on the sort key, which is the fastest thing
-this engine does. A spatial ordering would serve cone searches instead and would
-not help SSP at all. The spatial columns (`hpix29` and unit vectors) are still
-computed and stored, so a cone search is *correct* — it is simply not *pruned*, and
-on 18 billion rows that means minutes rather than milliseconds.
+Two parts:
 
-This is a per-dataset decision that can change. ClickHouse supports **projections**
-— a second physical ordering of the same table — so a dataset that needs both
-access patterns can have both, at the cost of storage and ingest time. Today
-`ssp` has none because nothing needs them yet; the `mppdb` and `ppdb` tables are
-spatially sorted because their use is positional; and `dp2`, when it lands, is
-expected to be spatial. If a use case starts needing cone searches over `ssp` at
-interactive speed, adding a spatial projection is the intended answer rather than a
-redesign. Note that the "nothing needs them" holds for the submission tooling,
-which was checked; it is not a statement about the SSP pipeline as a whole.
+- a **backend** on `sdfiana035`: the ClickHouse server, the ingest tooling, and
+  the catalog store. All writes happen here.
+- the **service**: the `mppdb` Phalanx application on `usdf-rsp-dev`. It reads the
+  backend and owns no data.
 
-Practically: use `TOP` while exploring, and prefer `/async` (a UWS job) over
-`/sync` for anything that might be slow — async results are spooled and survive a
-disconnect.
+```{mermaid}
+flowchart TB
+  subgraph BACKEND["backend · sdfiana035 · apptainer sandbox"]
+    ING["ingest: parquet / HATS / tapdump<br/>publishes data, then catalog"]
+    CH[("ClickHouse 26.6<br/>mppdb · ppdb · ssp<br/>TAP_SCHEMA + registries")]
+    ING --> CH
+  end
+  SVC["mppdb Phalanx app · usdf-rsp-dev<br/>/mppdb"]
+  U["users: console · TOPCAT · pyvo"]
+  CH -- "read-only, mppdb_ro" --> SVC
+  SVC --> U
+```
 
-The pruning works because each table's registry carries a `physical` block binding
-`ra`/`dec` to an `hpix29` column and unit vectors, which the query planner turns
-into HEALPix ranges. That block is why the catalog is kept as documents and not
-only as the VO-standard tables (§6).
+**Why it is split.** The service runs on Phalanx because Phalanx supplies what a
+user-facing service needs: Gafaelfawr authentication, container builds, ingress and
+TLS, secret management, and a reviewable deploy path. The backend cannot run there.
+WekaFS reaches this Kubernetes environment over NFS, and NFS is too slow for the
+data path. So the backend runs on a node where WekaFS is mounted natively, and the
+service reaches it over the network.
 
 :::{important}
-**Not every consumer goes through TAP.** The SSP submission portal reads a single
-ClickHouse **view**, `ssp.SubmittableSources` — an eleven-branch `UNION` presenting
-all eleven tables under ten `collection` labels — and connects to ClickHouse
-*directly* rather than through this service. That the view is **not currently in
-the registry, and so not advertised over TAP, is an oversight rather than a
-decision**; it is expected to be added. Verified 2026-08-23: present in the
-database, absent from `/tables`.
-
-Two consequences meanwhile. A reader comparing `/tables` against the database will
-find this one extra object, which is a known omission and not catalog drift. And
-the TAP service is not the only path to this data, so an outage of the service does
-not necessarily stop the pipeline that depends on the database.
-
-The view also *screens* eligibility rather than exposing raw rows: on the three
-products carrying a `sky_source` column it drops sky-source rows and null
-positions. "Eligible source" is therefore a filtered notion, not simply
-"everything in the table".
+The ideal deployment is one containerized application under Argo CD — server,
+ingest and service together, with no node to maintain by hand. Filesystem
+performance in Kubernetes is what blocks it, not anything about mppdb. Until that
+changes, the node is necessary and should not be moved into the cluster. See §17.
 :::
 
-## The data
+The unit of operation between the two parts is the catalog: a publish on the
+backend changes what the service should serve, and the service picks it up only
+when reloaded (§13).
 
-Three databases are served, all physically ClickHouse databases on the one
-server. Measured 2026-08-23:
+## The data: provenance and lifecycle
 
-| database | tables | rows | on disk | state |
-|---|---|---|---|---|
-| `ssp` | 11 served (+2 provenance, 1 view) | 93.77 B | 11.05 TiB | actively growing |
-| `mppdb` | 12 | 25.74 B | 2.57 TiB | static since 2026-07 |
-| `ppdb` | 3 | 48.70 M | 9.29 GiB | static since 2026-07-25 |
-| **total** | | **~119.5 B** | **13.64 TiB** | |
+**`mppdb`** is the original science import: DP2 prompt products mapped onto a
+curated registry generated from the vendored Felis `apdb.yaml`. Datatypes, units,
+UCDs and descriptions come from Felis; `hpix29`/`cx`/`cy`/`cz` spatial columns,
+principal flags and foreign keys were added. The three large DIA tables came from
+flat DP2 HATS exports via `mppdb ingest --from-hats`, which maps columns onto that
+registry rather than generating a schema. The small tables date to the original
+manual import. `mppdb` also has a Parquet lake and manifest chain on `/data`, left
+from the DuckDB era, which still backs snapshot semantics. Static since 2026-07.
 
-The four largest tables are all in `ssp`: `source_daytime` (43.54 B rows,
-4.37 TiB), `source_dp2` (20.66 B, 2.07 TiB), `source_nv` (17.99 B, 3.17 TiB) and
-`source_nv_orphaned` (9.17 B, 938 GiB).
-
-**`mppdb`** is the original science import: Rubin DP2 prompt products mapped onto
-a *curated* registry generated from the vendored Felis `apdb.yaml` — datatypes,
-units, UCDs and descriptions carried from Felis, with `hpix29`/`cx`/`cy`/`cz`
-spatial columns, principal flags and foreign keys layered on. The three large DIA
-tables were ingested from flat DP2 HATS exports with `mppdb ingest --from-hats`,
-which maps columns onto that curated registry rather than generating a schema;
-the small tables date to the original manual import. Uniquely, `mppdb` also has a
-Parquet lake and manifest chain on `/data` — a legacy of the DuckDB engine era
-that still backs snapshot semantics.
-
-**`ppdb`** is a static import of the Rubin Prompt Products Database: a TAP dump of
+**`ppdb`** is a static import of the Prompt Products Database: a TAP dump of
 `data-int.lsst.cloud/api/ppdbtap` loaded with `mppdb ingest-tapdump`.
-ClickHouse-only — no lake, no manifests, no GC. It is here as development
-substrate for the SSP daily data products pipeline (§2), which will write
-`sssource`, `ssobject` and `nearby_sso` back to the PPDB and read the `ssp` tables
-alongside — though that pipeline does not use this database yet.
+ClickHouse-only — no lake, no manifests, no GC. Unchanged since 2026-07-25.
 
 **`ssp`** is the solar-system working set: one table per export directory, each an
 `acid import butler --split-by visit` export of per-visit parquet parts with
-per-part manifests. Loaded with `mppdb ingest-parquet`, which *generates* the
-schema from the parquet, computes the spatial columns from `ra`/`dec`, converts
-NaN to NULL, and enforces type fidelity with a safe cast at staging — an
-`int64`→`int32` overflow refuses loudly. Three products are actively maintained
-(`source_daytime`, `source_nv`, `dia_source_prompt`) and grow by an append on the
-export side followed by `ingest-parquet run --append`, an incremental path keyed
-on immutable per-part manifests with a provenance ledger (`_ingest_parts`,
-`_ingest_refs`) in the served database recording (visit, detector) → part and
-maintaining the invariant `count(live) == sum(_ingest_parts.rows)` per table. The
-other eight are frozen.
+per-part manifests. Loaded with `mppdb ingest-parquet`, which generates the schema
+from the parquet, computes the spatial columns from `ra`/`dec`, converts NaN to
+NULL, and safe-casts at staging — an `int64`→`int32` overflow fails loudly.
 
-:::{warning}
-**Two `ssp` tables are irreplaceable.** `source_nv_orphaned` and
-`dia_source_2025lost` are recoveries of data whose Butler artifacts were deleted;
-their export directories on `/sdf` are the only durable copies, and
-`source_nv_orphaned` alone is 9.17 billion rows. These directories are primary
-data, not a cache. See §11.
-:::
+Three products are maintained and grow: `source_daytime`, `source_nv` and
+`dia_source_prompt`. An append on the export side is followed by
+`ingest-parquet run --append`, which reads the immutable per-part manifests and
+loads only what is new. A provenance ledger in the served database
+(`_ingest_parts`, `_ingest_refs`) maps (visit, detector) to part and holds the
+invariant `count(live) == sum(_ingest_parts.rows)` per table. The other eight
+products are frozen.
 
-**Publish mechanics, common to every ingest path:** load into a staging database,
-verify counts, publish with an atomic multi-pair `RENAME TABLE`, then record
-provenance. Readers never see a missing or half-loaded table. (`EXCHANGE TABLES`
-and `CREATE OR REPLACE` are unavailable — `renameat2()` is unsupported on the
-WekaFS data path.)
+**Publishing, for every ingest path:** load into a staging database, verify counts,
+publish with an atomic multi-pair `RENAME TABLE`, then record provenance. Readers
+never see a missing or half-loaded table. (`EXCHANGE TABLES` and
+`CREATE OR REPLACE` are unavailable: `renameat2()` is unsupported on the WekaFS
+data path.)
 
-**Cadence:** `mppdb` and `ppdb` are static; `ssp` arrives in bursts — whenever a
+**Cadence:** `mppdb` and `ppdb` are static. `ssp` arrives in bursts, whenever a
 nightly append actually appends, plus occasional metadata-only catalog publishes.
 Loads run on `sdfiana035` only, because staging goes through the ClickHouse
 server's node-local `user_files` directory.
 
 :::{important}
-A fourth database, **`dp2`** — thirteen DP2 release products, ~91.4 B rows — is
-planned and approved, execution gated on the export completing. Ownership of
-`ssp`'s ingest configs, loads and catalog content sits with the ssp-submit
-project, not with the service.
+A fourth database, `dp2` — thirteen DP2 release products, about 91.4 B rows — is
+planned and approved, waiting on the export. `ssp`'s ingest configs, loads and
+catalog content are owned by the ssp-submit project, not by the service.
 :::
 
-## Whether it works: ingest and query at scale
+## Ingest and query performance
 
-Two things had to be true for this to be useful at all, and both are load-bearing
-enough to state with measurements rather than adjectives.
+Two things had to be true: datasets of this size must load in hours and be
+extendable incrementally, and queries must return quickly. Both hold.
 
-### Ingest must be fast, and incremental
-
-A dataset of tens of billions of rows and tens of terabytes has to land in hours,
-not weeks — and then be *extended* without reloading. Both hold today.
-
-A dataset's journey has two stages — Butler repository to an export, then export
-into ClickHouse — and both were measured on this hardware.
+A dataset moves in two stages, Butler to export and export to ClickHouse. Both
+were measured on this hardware:
 
 | stage | measured |
 |---|---|
-| Butler → HATS export (`acid import butler`, DP2, 2026-08-23) | **91.44 G rows / 13.78 TB in 7.0 h wall**, across six 128-core hosts running one dataset each |
-| export → ClickHouse (`ingest-parquet`, 64 workers, one host) | **~200 M rows/min**, bounded by WekaFS read bandwidth rather than by ClickHouse |
-| the full `ssp` rebuild (93.76 B rows, 11.05 TiB) | ≈ 8 h of load time at that rate |
+| Butler → HATS export (`acid import butler`, DP2, 2026-08-23) | 91.44 G rows / 13.78 TB in **7.0 h**, six 128-core hosts, one dataset each |
+| export → ClickHouse (`ingest-parquet`, 64 workers, one host) | **~200 M rows/min**, limited by WekaFS read bandwidth, not by ClickHouse |
+| full `ssp` rebuild (93.76 B rows, 11.05 TiB) | about **8 h** of load time |
 
-So a release-scale dataset moves from Butler to a queryable table in **hours at each
-stage** on comparable hardware. That is the claim worth making; a *rate* comparison
-between the two stages would be misleading, for two reasons worth stating because
-they will trip up the next person to measure this:
+So a release-scale dataset goes from Butler to a queryable table in hours at each
+stage. Do not turn that into a rate comparison between the stages:
 
-- **Per-host rates differ by about 6x.** The export's 217 M rows/min aggregate is
-  six hosts; per host it is ~36 M rows/min against the load step's ~200 M on one.
-  The export also does strictly more work — read artifacts, shard, spill, read the
-  spill back, spatially sort, write partitions, build a margin cache — with one
-  product pushing 8.8 TB through the shuffle before writing 9.76 TB.
-- **Rows per minute is the wrong unit upstream.** Across the DP2 products it varies
-  **60x** (5.8–352 M rows/min), almost entirely with row *width*: one table is 1,225
-  columns wide, another 29. Byte rate over the same products varies only ~4x
-  (5.8–23.3 GB/min), so **GB/min is the honest upstream unit**. Two products bracket
-  the behaviour: `object_forced_source` at 44.7 G rows / 912 GB in 127 min (the
-  many-rows case) and `source` at 17.6 G rows / 9.76 TB in 419 min (the many-bytes
-  case).
+- **Per host the rates differ about sixfold.** The export's 217 M rows/min is six
+  hosts together; per host it is ~36 M rows/min against the load step's ~200 M on
+  one. The export also does more work — read, shard, spill, re-read, spatially
+  sort, write, build a margin cache. One product pushed 8.8 TB through the shuffle
+  before writing 9.76 TB.
+- **Rows per minute is the wrong unit upstream.** It varies 60x across the DP2
+  products (5.8–352 M rows/min), almost entirely with row width: one table is 1,225
+  columns, another 29. Byte rate varies only about 4x (5.8–23.3 GB/min), so GB/min
+  is the honest upstream unit. Two products bracket it: `object_forced_source`,
+  44.7 G rows / 912 GB in 127 min; `source`, 17.6 G rows / 9.76 TB in 419 min.
 
-**Incrementality holds at both stages, and this is what makes the system
-sustainable rather than a one-off.** Downstream, an append reads the immutable
-per-part manifests, loads only parts not already in the provenance ledger, and
-refuses rather than guesses if the ledger cannot account for the table. Upstream,
-the flat per-visit exports work the same way: a no-op nightly run over a
-70,946-group product takes **24 seconds**, and a real append of 940,680 refs /
-118.5 M rows takes about **9 minutes**. Bulk in hours, nightly extension in
-seconds to minutes, at both layers.
+**Incremental extension works at both stages**, which is what makes this
+sustainable. Downstream, an append loads only parts absent from the ledger and
+fails rather than guessing if the ledger cannot account for the table. Upstream,
+the flat per-visit exports do the same: a no-op nightly run over a 70,946-group
+product takes **24 s**, and a real append of 940,680 refs / 118.5 M rows takes
+about **9 min**.
 
 :::{important}
-**HATS exports are one-off per release, not incremental.** There is no append mode
-for a HATS collection — it is all-or-nothing, so re-importing is a full rebuild.
-The 7 hours above is the cost of a *release*, not of a night. Only the flat
-per-visit exports have the incremental path.
+HATS exports are one-off per release. There is no append mode for a HATS
+collection, so re-importing means a full rebuild, and the 7 hours above is the cost
+of a release rather than of a night. Only the flat per-visit exports are
+incremental.
 :::
 
-**Where the time goes** — offered as informed inference, not as a profile, since
-the export was not instrumented. The bulk case is WekaFS-bandwidth-bound, the same
-constraint as the load step. The many-small-artifacts case is instead
-registry-latency-bound: one product needed 92 minutes for a fifth of another's
-bytes because it was 183,169 datastore artifacts, one registry query each. That
-second effect is upstream-only and has no analogue on the ClickHouse side. Very
-wide tables are CPU- and writer-memory-bound.
+**Where the time goes** — inference, not a profile; the export was not
+instrumented. The bulk case is WekaFS-bandwidth-bound, like the load step. The
+many-small-artifacts case is registry-latency-bound instead: one product took 92
+minutes for a fifth of another's bytes because it was 183,169 datastore artifacts,
+one registry query each. That effect is upstream-only. Very wide tables are CPU-
+and writer-memory-bound.
 
-These figures come from a single day's run with a warm-ish filesystem, six
-concurrent imports contending for one WekaFS namespace, and partitioning
-parameters inherited rather than tuned; a dedicated run on a quiet filesystem
-would be faster by an unmeasured margin. Every row count matched an independent
-earlier import of the same collection exactly, and all thirteen products succeeded
-on the first attempt. Per-catalog `acid-import-log.yaml` files under the DP2
-export directory record each run's arguments, worker counts, totals and elapsed
-time, and travel with the data.
-
-### Queries must return quickly at that scale
-
-ClickHouse makes a 40-billion-row table interactively queryable when the query
-matches how the table is physically ordered. That ordering is a **per-dataset
-choice**, matched to how each dataset is actually used — see “What a query can prune on”
-under Querying the service, which is the single most useful thing for a user of
-this service to understand.
+These figures come from one day, with a warm-ish filesystem, six concurrent
+imports sharing one WekaFS namespace, and inherited rather than tuned partitioning.
+A dedicated run on a quiet filesystem would be faster by an unmeasured margin.
+Every row count matched an independent earlier import of the same collection, and
+all thirteen products succeeded first time. Per-catalog `acid-import-log.yaml`
+files under the DP2 export directory record each run's arguments, worker counts,
+totals and elapsed time.
 
 ## The catalog store
 
-Since 2026-08-22 the **catalog of record is the `TAP_SCHEMA.registries` table** in
-ClickHouse, not files on disk. One row per served database holds the registry
-document verbatim as YAML, its sha256, a global monotonic `generation`, and
-publication provenance. The five standard TAP_SCHEMA tables (`schemas`, `tables`,
-`columns`, `keys`, `key_columns`) are a **pure projection** of the store: every
-publish rederives all five from every stored document and swaps them in with one
-multi-pair rename.
+Since 2026-08-22 the catalog of record is the `TAP_SCHEMA.registries` table, not
+files. One row per database holds the registry document verbatim as YAML, its
+sha256, a monotonic `generation`, and publication provenance. The five standard
+TAP_SCHEMA tables are a projection of the store: every publish rederives all five
+from every stored document and swaps them in with one multi-pair rename.
 
-Two consequences worth stating plainly. There is no longer any window in which a
-TAP_SCHEMA table is absent. And an incomplete input can no longer delete a
-schema — configuration is not an input to derivation, the store is.
+Two results. There is no window where a TAP_SCHEMA table is absent. And an
+incomplete input can no longer delete a schema, because configuration is not an
+input to the derivation — the store is.
 
-The store keeps verbatim YAML rather than only the five tables because TAP_SCHEMA
-is a lossy projection: the registry's `physical` block, which drives the spatial
-pruning described in §3, has no column in the VO-standard tables.
+The store keeps the YAML, not just the five tables, because TAP_SCHEMA is a lossy
+projection. The registry's `physical` block — the spatial binding and HEALPix depth
+that drive cone-search pruning — has no column in the VO-standard tables.
 
-**Generation semantics.** The generation is bumped only when the store actually
-changes. A byte-identical publish is a store no-op that still rederives the five
-tables — which makes `mppdb catalog publish` the documented repair for a damaged
-projection.
+**Generation** advances only when the store changes. A byte-identical publish is a
+no-op that still rederives the five tables, which makes `catalog publish` the
+repair for a damaged projection.
 
-**Publishing.** `mppdb catalog publish --schema X FILE` runs under an on-node
-lock, sha-verifies the store, diffs the incoming document against the stored one,
-**refuses any removal without `--allow-remove`**, writes the store with the
-rename pattern, and rederives. `catalog diff` and `catalog show` are read-only.
-Ingest publishes its own catalog — data first, catalog second, deliberately: a
-crash between the steps leaves a loaded-but-unadvertised table, which
-re-publishing heals, whereas the reverse order would advertise a table that does
-not exist. The upsert is column-grain, so curated `description`/`unit`/`ucd`
-values survive a re-ingest.
+**Publishing.** `mppdb catalog publish --schema X FILE` takes an on-node lock,
+sha-verifies the store, diffs the incoming document against the stored one, refuses
+any removal without `--allow-remove`, writes the store with the rename pattern, and
+rederives. `catalog diff` and `catalog show` are read-only. Ingest publishes its
+own catalog, data first and catalog second: a crash between the two leaves a loaded
+but unadvertised table, which republishing fixes, whereas the reverse order would
+advertise a table that does not exist. The upsert is column-grain, so curated
+`description`, `unit` and `ucd` values survive a re-ingest.
 
-**How a front-end consumes it.** Under the ClickHouse engine the service loads
-its catalog *only* from the store, at startup, refusing to boot on a missing or
-sha-mismatched document rather than falling back to anything baked into its
-image. At runtime the catalog is one immutable object behind a single reference;
-`SIGHUP` rebuilds and rebinds it, **fail-safe** — a bad input keeps the
-previously-served catalog, logs loudly, and does not exit. That is deliberately
-the opposite of startup, where there is nothing good to keep serving.
+**How the service consumes it.** The service loads its catalog only from the store,
+at startup, and refuses to boot on a missing or sha-mismatched document rather than
+falling back to anything in its image. At runtime the catalog is one immutable
+object behind a single reference. `SIGHUP` rebuilds and rebinds it, and is
+fail-safe: bad input keeps the previous catalog, logs loudly, and does not exit.
+Startup is deliberately the opposite, because there is nothing good to keep
+serving. `GET /catalog` reports the served generation and per-schema digests, which
+is what makes publishing and reloading checkable instead of assumed.
 
-`GET /catalog` reports the served generation and per-schema sha256s. It is what
-makes both publishing and reloading verifiable rather than inferred, and it is
-the basis of the currency check in §9.
-
-## The two deployments
+## The deployments
 
 ### The backend node
 
 Everything that writes lives on `sdfiana035`, inside an apptainer sandbox whose
-rootfs is a writable directory on WekaFS. It is here rather than in Kubernetes for
-the reason given in §1: WekaFS reaches the cluster over NFS, which is far too slow
-for the data path. The node is a deliberate compromise, not an accident of
-history.
+root filesystem is a writable directory on WekaFS. It is here rather than in
+Kubernetes for the reason in §8.
 
-**ClickHouse** runs there as a plain daemon. There is no systemd in the
-container and **no automatic restart after a host reboot** — bringing it back is a
-manual, documented step, including a tmpfs directory that a reboot wipes. Its
-`user_files` staging directory is node-local scratch, visible under two names for
-one inode, which is why loaders may run inside or outside the container but never
-off-node.
+**ClickHouse** runs there as a plain daemon. There is no systemd in the container
+and no automatic restart after a host reboot; bringing it back is a documented
+manual step, including a tmpfs directory that a reboot wipes. Its `user_files`
+staging directory is node-local scratch, visible under two names for one inode,
+which is why loaders may run inside or outside the container but never off-node.
 
-**The ingest and catalog tooling** runs from a git checkout at
+**Ingest and catalog tooling** runs from a git checkout at
 `/root/projects/github.com/mjuric/mppdb`, kept on `main`, through its editable
-venv; `git pull` is how that tooling is updated. This is where
-`mppdb ingest-parquet`, `ingest --from-hats`, `ingest-tapdump` and
-`mppdb catalog publish` are run, and where their configuration lives:
-`deploy/usdf/mppdb.toml` carries the `[databases]` block — the *authorization
-boundary* naming which ClickHouse databases are in play — alongside committed
-scalars in `mppdb.env` and two git-ignored mode-600 secret files.
+venv. `git pull` updates it. Configuration lives in `deploy/usdf/mppdb.toml` — the
+`[databases]` block is the authorization boundary, naming which ClickHouse
+databases are in play — plus committed scalars in `mppdb.env` and two git-ignored
+mode-600 secret files.
 
-**Loads run on this node only**, because staging goes through the ClickHouse
-server's node-local `user_files` directory. There are no credentials beyond being
-on the node (§11).
+### The Phalanx application
 
-### The Phalanx front-end, on usdf-rsp-dev
+Reads the backend, owns no data. Defined in `applications/mppdb/`, currently image
+`ghcr.io/mjuric/mppdb:sha-35bd883`.
 
-A front-end-only deployment: it queries the shared ClickHouse read-only and owns
-no data. Defined as the `mppdb` application in Phalanx
-(`applications/mppdb/`), currently image `ghcr.io/mjuric/mppdb:sha-35bd883`.
-
-| Aspect | How |
+| aspect | how |
 |---|---|
-| Auth | `GafaelfawrIngress`, scope `read:tap`; the service trusts the ingress-injected username header and provisions an account on first sight |
-| Path | `/mppdb`, with the prefix stripped before the pod, which the app compensates for when generating URLs |
-| Database credential | `mppdb_ro`, SELECT-only on `mppdb`, `ppdb`, `ssp`, `TAP_SCHEMA` and `system.parts` |
-| State | a 20 GiB `wekafs` ReadWriteOnce volume at `/data` |
-| Replicas | exactly **one**, `strategy: Recreate` — the state engine is single-writer, and two writers corrupt `state.db` |
-| Secrets | hand-created Kubernetes secrets: `mppdb` (the database credential) and `mppdb-pull` (a registry token) |
-| Catalog | loaded from the store at startup; refreshed by `SIGHUP`, never by redeploy |
+| auth | `GafaelfawrIngress`, scope `read:tap`; the service trusts the username header the ingress injects and creates the account on first sight |
+| path | `/mppdb`, prefix stripped before the pod; the app adds it back when generating URLs |
+| database credential | `mppdb_ro`: SELECT on `mppdb`, `ppdb`, `ssp`, `TAP_SCHEMA`, `system.parts` |
+| state | 20 GiB `wekafs` ReadWriteOnce volume at `/data` |
+| replicas | exactly one, `strategy: Recreate` — the state engine is single-writer and two writers corrupt `state.db` |
+| secrets | hand-created: `mppdb` (database credential) and `mppdb-pull` (registry token) |
+| catalog | loaded from the store at startup, refreshed by `SIGHUP`, never by redeploy |
 
 :::{important}
-The two secrets are created by hand because this deployment has no Vault access
-yet. The chart carries a `useVaultSecret` flag; turning it on produces a
-`VaultSecret` of the same name, so the cutover replaces them in place and changes
-nothing else.
+The two secrets are hand-created because this deployment has no Vault access yet.
+The chart has a `useVaultSecret` flag; turning it on produces a `VaultSecret` of the
+same name, so the swap changes nothing else.
 :::
 
-## Operating the system
+## Operating the service
 
-### Is it current? Store versus served
+### Is the service serving the current catalog?
 
-The service loads its catalog at startup and holds it until reloaded, so "is the
-service serving the current catalog?" is a real question with a cheap answer:
-compare what the store holds with what the service reports.
+The service loads its catalog at startup and holds it until reloaded, so this is a
+real question with a cheap answer. Compare what the store holds with what the
+service reports.
 
-The service's side needs no credentials at all:
+The service side needs no credentials:
 
 ```
 curl -s https://usdf-rsp-dev.slac.stanford.edu/mppdb/catalog
@@ -552,8 +494,7 @@ curl -s https://usdf-rsp-dev.slac.stanford.edu/mppdb/catalog
  "schemas": {"mppdb": "46b4daa8…", "ppdb": "bcc3d3f9…", "ssp": "edfb9aa7…"}}
 ```
 
-The store's side is one query, answerable with the service's own read-only
-database credential:
+The store side is one query, using the service's own read-only credential:
 
 ```sql
 SELECT schema_name, generation, substring(sha256, 1, 10), published_at
@@ -561,18 +502,17 @@ FROM TAP_SCHEMA.registries ORDER BY schema_name
 ```
 
 Equal generations and matching digests mean the service is current. A store
-generation ahead of the served one means a publish has happened and the service
-has not reloaded — which names the problem precisely rather than leaving it to be
-inferred from a query that fails. On the backend node, `mppdb catalog show`
-reports the same thing with provenance.
+generation ahead of the served one means a publish happened and the service has not
+reloaded. On the backend node, `mppdb catalog show` reports the same with
+provenance.
 
 ### After a catalog change
 
-On the backend node, after any catalog change:
+On the backend node:
 
 ```
 mppdb catalog publish --schema <s> <file>    # or an ingest, which publishes itself
-mppdb catalog show                           # what the store now holds, with provenance
+mppdb catalog show
 ```
 
 Then make the service pick it up:
@@ -581,29 +521,28 @@ Then make the service pick it up:
 kubectl -n mppdb exec deploy/mppdb -- mppdb reload --wait
 ```
 
-`reload --wait` polls a target captured *before* the signal, so a concurrent
-publish of another schema cannot fake a timeout, and its exit codes are
-load-bearing: **0** landed, **2** refused (stale pidfile, wrong host), **3** timed
-out — which means *unknown*, not failed. A refused reload leaves the served
-generation unadvanced, so the same poll detects both outcomes.
+`reload --wait` polls a target captured before the signal, so a concurrent publish
+of another schema cannot fake a timeout. Its exit codes matter: 0 landed, 2 refused
+(stale pidfile, wrong host), 3 timed out — which means unknown, not failed. A
+refused reload leaves the served generation unadvanced, so the same poll detects
+both.
 
 :::{important}
-Reloading is a per-front-end action with no coordinator. A publish makes the
-store current; each front-end serves its last-loaded catalog until something
-reloads it. Table **removals and renames** are the dangerous case, because a
-front-end that has not reloaded advertises tables whose queries now fail while
-its catalog still looks healthy — additions merely hide a new table.
+Reloading is per-service and nothing coordinates it. A publish makes the store
+current; the service serves its last-loaded catalog until reloaded. Removals and
+renames are the dangerous case: a service that has not reloaded advertises tables
+whose queries now fail, while its catalog still looks healthy. Additions only hide
+a new table.
 :::
 
 ### Checking data and the service
 
-After a data load, verify that served rows equal the export's declared rows
-exactly, and that the ledger reconciles (`sum(_ingest_parts.rows)` equals the
-live count, per table). Before an append, `ingest-parquet run <cfg> --append
---dry-run` shows the disk-versus-ledger delta and `--audit` finds torn parts and
-stale run markers.
+After a load, check that served rows equal the export's declared rows exactly, and
+that the ledger reconciles — `sum(_ingest_parts.rows)` equals the live count, per
+table. Before an append, `ingest-parquet run <cfg> --append --dry-run` shows the
+disk-versus-ledger delta and `--audit` finds torn parts and stale run markers.
 
-Row counts and sizes come from ClickHouse metadata, not from scanning:
+Row counts and sizes come from metadata, not from scanning:
 
 ```sql
 SELECT database, formatReadableQuantity(sum(rows)),
@@ -611,142 +550,133 @@ SELECT database, formatReadableQuantity(sum(rows)),
 FROM system.parts WHERE active GROUP BY database
 ```
 
-The web console's sidebar uses exactly this, which is why the read-only user
-needs `SELECT` on `system.parts`; without it the sidebar silently falls back to
-showing column counts instead of row counts.
+The console's schema browser uses this, which is why the read-only user needs
+`SELECT` on `system.parts`. Without it the browser silently shows column counts
+instead of row counts.
 
 ## Maintaining and upgrading
 
-**The backend tooling** updates with `git pull` in its checkout; there is no
-service there to restart, only the ClickHouse daemon, which is left alone.
+**Backend tooling** updates with `git pull`. There is no service to restart there,
+only the ClickHouse daemon, which is left alone.
 
-**The service** upgrades by building an image from its branch, pinning
-the `sha-<commit>` tag in `values-usdfdev.yaml`, and syncing the Argo CD
-application. Two rules learned the hard way:
+**The service** upgrades by building an image from its branch, pinning the
+`sha-<commit>` tag in `values-usdfdev.yaml`, and syncing the Argo CD application.
+Two rules learned the hard way:
 
-1. **Verify the mechanism, not just the result.** A configuration flip that
-   silently does nothing can look exactly like success when the before and after
-   states are identical. Confirm the mechanism directly — the config value inside
-   the running pod, the log line, the `/catalog` generation — rather than
-   inferring it from output that would match either way.
+1. **Check the mechanism, not just the result.** A config change that silently does
+   nothing looks exactly like success when before and after are identical. Confirm
+   the mechanism directly — the value inside the running pod, the log line, the
+   `/catalog` generation — not output that would match either way.
 2. **Render a chart template before pushing it.** The repository's linters do not
-   render Helm templates, so a structurally broken template passes lint and fails
-   only at deploy.
+   render Helm templates, so a broken template passes lint and fails at deploy.
 
 **Dependency pins.** The container build pins third-party artifacts by checksum
-against **per-release** URLs. A pin against an unversioned "latest" URL breaks on
-every upstream release and teaches operators to ignore it; a pin against an
-immutable URL means a mismatch is a real signal. When a pin must be bumped, two
-independent fetches agreeing is the minimum evidence, and the reasoning belongs in
-a comment for whoever bumps it next.
+against per-release URLs. A pin against an unversioned "latest" URL breaks on every
+upstream release and teaches operators to ignore it; against an immutable URL, a
+mismatch means something real. When a pin must be bumped, two independent fetches
+agreeing is the minimum evidence, and the reasoning belongs in a comment.
 
 ## Troubleshooting
 
-Symptoms that have actually occurred, with causes and fixes.
+Symptoms that have happened, with causes.
 
-A front-end advertises tables whose queries fail
-: Its catalog predates a retirement. Compare the two `/catalog` outputs (§9.1),
-  then `mppdb reload --wait`. The catalog looks healthy throughout, which is what
-  makes this one nasty.
+The service advertises tables whose queries fail
+: Its catalog predates a retirement. Compare store and served (§13.1), then
+  `mppdb reload --wait`. The catalog looks healthy throughout, which is what makes
+  this one hard to notice.
 
-`mppdb reload --wait` reports a timeout (exit 3)
-: Unknown, not failed — the reload may have landed. Check `/catalog`. On a
-  deployment where a proxy strips a URL prefix, older builds polled the wrong
-  local URL and always timed out; `--url http://127.0.0.1:8080` is the
-  workaround, fixed upstream.
+`mppdb reload --wait` times out (exit 3)
+: Unknown, not failed — the reload may have landed. Check `/catalog`. On
+  deployments where a proxy strips a URL prefix, older builds polled the wrong
+  local URL and always timed out; `--url http://127.0.0.1:8080` is the workaround,
+  fixed upstream.
 
 The service refuses to start, complaining about the catalog
-: Under the ClickHouse engine there is no fallback: a missing, empty,
-  unparseable, duplicated or sha-mismatched document aborts startup by design.
-  Publish the catalog, then start.
+: By design there is no fallback: a missing, empty, unparseable, duplicated or
+  sha-mismatched document aborts startup. Publish the catalog, then start.
 
 Async queries fail in the browser with a network error
-: The job URL was minted as `http://` while the page is `https://`, and the
-  browser blocks the cross-scheme request. Behind a TLS-terminating proxy the
-  service must be told to pin its advertised base URL rather than derive it from
-  the request.
+: The job URL was minted as `http://` while the page is `https://`, and the browser
+  blocks the cross-scheme request. Behind a TLS-terminating proxy the service must
+  pin its advertised base URL rather than derive it from the request.
 
-The web console loads but its assets 404
-: The service is hosted under a URL prefix it does not know about. It must be
-  told its public base URL so that generated asset and API paths carry the
-  prefix.
+The console loads but its assets 404
+: The service is hosted under a URL prefix it does not know about. It needs its
+  public base URL so generated paths carry the prefix.
 
-Newly added UI files return 401 until a restart
-: The anonymous-asset allowlist is read at startup. Restart in the same breath as
-  any deploy that adds served UI files.
+Newly added console files return 401 until a restart
+: The anonymous-asset allowlist is read at startup. Restart in the same step as any
+  deploy that adds served files.
 
 HTTP 403 fetching a file that is listed
-: A permissions mismatch rather than a missing file — the serving process is not
-  in the group the mode assumes.
+: A permissions mismatch, not a missing file — the serving process is not in the
+  group the mode assumes.
 
 `FILE_DOESNT_EXIST` deep inside a load
 : The wrong `--user-files-root`. The CLI default matches neither the stock
   ClickHouse path nor this deployment's.
 
 An `--append` refuses
-: The provenance ledger cannot account for the table. Never force it; re-import
-  wholesale.
+: The ledger cannot account for the table. Do not force it; re-import wholesale.
 
 ## Known gaps
 
 Ordered by how much they should worry a new owner.
 
 1. **No durability story.** One node, one ClickHouse server, no replication, no
-   backups of 13.64 TiB. For most tables the source parquet is a de facto backup,
-   and the databases can be rebuilt from their exports. The exception is the two
-   recovered `ssp` products, whose Butler datasets no longer exist: their
-   canonical copies are the **scratch FITS files** and the **ADES/PSV file** those
-   tables were reconstructed from, with the parquet exports derived from them.
-   Those canonical inputs are irreplaceable and need an explicit protection
-   commitment — separately from, and more urgently than, a backup story for the
-   served databases.
-2. **The backend does not survive a host reboot unattended.** ClickHouse must be
-   started by hand, in a documented order, including a tmpfs directory a reboot
-   wipes. Until it is, every query fails — the service comes back on its own but
-   has nothing to read.
-3. **NetworkPolicy is not enforced** on the `usdf-rsp-dev` cluster. The Phalanx
-   front-end trusts an identity header injected by its ingress, which is only
-   safe if nothing else can reach the pod; a NetworkPolicy is applied and
-   correct, but an in-cluster pod was able to bypass it and forge the header.
-   External access remains gated by Rubin SSO, so the exposure is in-cluster
-   pod-to-pod — acceptable for a dev deployment, and a blocker for production.
+   backups of 13.64 TiB. Most databases can be rebuilt from their exports. The
+   exception is the two recovered `ssp` products, whose Butler datasets are gone:
+   their canonical copies are the scratch FITS files and the ADES/PSV file they
+   were rebuilt from. Those need an explicit protection commitment, separately from
+   and more urgently than a backup story for the served databases.
+2. **The backend does not survive a host reboot.** ClickHouse must be started by
+   hand, in a documented order, including a tmpfs directory a reboot wipes. Until
+   it is, every query fails: the service returns on its own but has nothing to
+   read.
+3. **NetworkPolicy is not enforced** on `usdf-rsp-dev`. The service trusts an
+   identity header injected by its ingress, which is only safe if nothing else can
+   reach the pod. A NetworkPolicy is applied and correct, but an in-cluster pod
+   bypassed it and forged the header. External access is still gated by Rubin SSO,
+   so the exposure is pod-to-pod inside the cluster — acceptable for dev, a blocker
+   for production.
 4. **The node-trust model.** ClickHouse's `default` user — no password, restricted
-   to the node — is the write credential for everything including the catalog
-   store. Being on the node *is* the credential. That is a deliberate pilot
-   decision, and it means any on-node process can write production data; it has
-   already caused two incidents in testing, both caught and repaired the same
-   day. Promotion requires real accounts for writers.
-5. **Secrets are hand-created** on the Phalanx side, pending Vault access.
-6. **A single service replica.** `state.db` is single-writer by design, so the
-   service does not scale horizontally without upstream work.
+   to the node — is the write credential for everything, including the catalog
+   store. Being on the node is the credential. That is a deliberate pilot decision,
+   and it means any on-node process can write production data; it has already
+   caused two incidents in testing, both repaired the same day. Production needs
+   real accounts for writers.
+5. **Secrets are hand-created** on the service side, pending Vault access.
+6. **One service replica.** `state.db` is single-writer, so the service does not
+   scale horizontally without upstream work.
 7. **Catalog updates are partly manual.** `ingest-tapdump` does not publish to the
-   store, so `ppdb` catalog updates are hand-run; `catalog publish` has no
-   compare-and-set staleness guard, so a stale local document can silently revert
-   curated metadata, mitigated today by operator convention.
-8. **Single-operator knowledge.** The runbooks in the mppdb repository are good,
-   but this note is the first document an outside operator could start from.
+   store, so `ppdb` catalog updates are hand-run. `catalog publish` has no
+   compare-and-set staleness guard, so a stale local document can revert curated
+   metadata; operator convention is the current mitigation.
+8. **`ssp.SubmittableSources` is not advertised over TAP** (§7), an omission rather
+   than a decision.
+9. **Single-operator knowledge.** The mppdb repository's runbooks are good, but
+   this note is the first document an outside operator could start from.
 
-## What promotion to production requires
+## What production would require
 
-Not yet done, and listed as a handover checklist rather than a plan of record.
+A handover checklist, not a plan of record.
 
-1. **A performant data path inside Kubernetes**, which is what would allow the
-   whole system — ClickHouse, ingest and service — to become a single Phalanx
-   application instead of a cluster front-end talking to a hand-kept node. Every
-   other item on this list is smaller than this one, and several of them
-   (unattended restart, node-trust, secret management) would disappear with it
-   rather than needing separate solutions. It is not an mppdb work item: it needs
-   WekaFS reachable from the cluster at native speed rather than over NFS.
-2. **A durability commitment**, starting with the two irreplaceable `ssp` export
-   directories, then a backup or replication story for the served databases.
-3. **Unattended restart**: supervised startup of ClickHouse, the service and the
-   ingress path, in the right order, without a human.
-4. **Real ClickHouse accounts for writers**, so that presence on the node is no
-   longer a credential.
-5. **Confirm NetworkPolicy enforcement** on the hosting cluster, or replace the
-   front-end's header trust with token verification it performs itself.
-6. **Vault-managed secrets** on the Phalanx side, replacing the hand-created ones.
-7. **Assign an owner**, and record the owning team and contact channels — this
-   note, and the service pages, should name them.
-8. **Alerting**: nothing currently reports a failed ingest, a stale service
-   catalog, or a service that did not come back after a reboot.
+1. **A performant data path inside Kubernetes.** This is what would let the whole
+   system become one Phalanx application instead of a cluster front-end talking to
+   a hand-maintained node. Several other items here — unattended restart,
+   node-trust, secret management — would disappear with it rather than needing
+   separate fixes. It is not an mppdb work item: it needs WekaFS reachable from the
+   cluster at native speed rather than over NFS.
+2. **A durability commitment**, starting with the canonical FITS and PSV files
+   behind the two recovered `ssp` products, then a backup or replication story for
+   the served databases.
+3. **Unattended restart** of ClickHouse and the service, in the right order,
+   without a human.
+4. **Real ClickHouse accounts for writers**, so that being on the node stops being
+   a credential.
+5. **Confirm NetworkPolicy enforcement**, or replace the service's header trust
+   with token verification it performs itself.
+6. **Vault-managed secrets**, replacing the hand-created ones.
+7. **An owner**, named here and on the service pages.
+8. **Alerting.** Nothing reports a failed ingest, a stale catalog, or a backend
+   that did not come back after a reboot.
