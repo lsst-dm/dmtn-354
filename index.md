@@ -453,8 +453,7 @@ advertise a table that does not exist. The upsert is column-grain, so curated
 **`principal` does not survive a re-ingest.** The column-grain merge does not
 preserve it, and ingest does not set it, so re-ingesting a table drops its
 principal flags — which is what SCS uses to find a row identifier and to define
-VERB=2. The flags then need re-applying by hand as part of the rebuild.
-Tracked as [mppdb#186](https://github.com/mjuric/mppdb/issues/186).
+VERB=2. A rebuild therefore needs the flags re-applied as a deliberate step.
 :::
 
 **How the service consumes it.** The service loads its catalog only from the store,
