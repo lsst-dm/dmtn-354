@@ -1,11 +1,13 @@
-# mppdb: SQL and TAP Analytics for Rubin Catalogs at the USDF
+# River: A Fast, Scalable, Evergreen SQL and TAP Database of Rubin Prompt, Data Release, Nightly Validation and Solar System Catalogs
 
 ```{abstract}
-mppdb is a SQL analytics database for Rubin catalog data, with a TAP 1.1 service
+River is a SQL analytics database for Rubin catalog data, with a TAP 1.1 service
 providing an ADQL/TAP API and a web UI over it. It holds **185 billion rows**
 across three databases on one ClickHouse server at the USDF — the DP2 data
 release, the Solar System Processing working set, and a Prompt Products snapshot
-— and you query it from TOPCAT, pyvo, or its own web console.
+— and you query it from TOPCAT, pyvo, or its own web console. River is the
+deployment; `mppdb` is the software it runs, which is why that name persists
+throughout its configuration and tooling.
 
 It is fast enough to use interactively at that scale. Indexed lookups and
 sky-position cone searches return in **under a second**, aggregates over a
@@ -14,7 +16,9 @@ billion rows in **a few seconds**, and the slowest case measured — an
 **three to five minutes**. Ingest is on the same footing: a release-scale
 dataset goes from a Butler repository to a queryable table in **hours**, at about
 **200 million rows per minute** into ClickHouse, and nightly appends extend it
-**incrementally, in minutes**.
+**incrementally**: a no-op nightly pass costs 24 s and a real append of 118.5
+million rows about 9 minutes. River can be thought of as APDB, PPDB and Qserv
+rolled into one, with update capability.
 
 It exists to give Solar System Processing — and Rubin catalog QA generally —
 somewhere to run SQL across a whole dataset. Two of these databases back
@@ -28,7 +32,7 @@ second half is for people running it.
 
 ## Scope and status
 
-The service runs at <https://usdf-rsp-dev.slac.stanford.edu/mppdb>. Anyone who can
+The service runs at <https://usdf-rsp-dev.slac.stanford.edu/river>. Anyone who can
 log in to `usdf-rsp-dev` can query it.
 
 It is a pilot. It runs on one node, has no replication and no backups, and does
@@ -55,7 +59,7 @@ about 0.2 s.
 
 ### Getting started
 
-Open <https://usdf-rsp-dev.slac.stanford.edu/mppdb/ui/>. Rubin SSO logs you in and
+Open <https://usdf-rsp-dev.slac.stanford.edu/river/ui/>. Rubin SSO logs you in and
 your account is created on first visit. Anyone who can log in to `usdf-rsp-dev`
 can query.
 
@@ -143,7 +147,7 @@ magnitudes are `-2.5 * LOG10(psfFlux) + 31.4`.
 
 ### Scripted access
 
-The TAP endpoint is `https://usdf-rsp-dev.slac.stanford.edu/mppdb`. Mint a token
+The TAP endpoint is `https://usdf-rsp-dev.slac.stanford.edu/river`. Mint a token
 at <https://usdf-rsp-dev.slac.stanford.edu/settings/tokens/new> with scope
 `read:tap`. It is an RSP token; the service does not issue its own.
 
@@ -159,11 +163,11 @@ more than a minute:
 import pyvo, requests
 from pathlib import Path
 
-tok = Path.home() / ".mppdb.token"      # chmod 600
+tok = Path.home() / ".river.token"      # chmod 600
 session = requests.Session()
 session.headers["Authorization"] = "Bearer " + tok.read_text().strip()
 service = pyvo.dal.TAPService(
-    "https://usdf-rsp-dev.slac.stanford.edu/mppdb", session=session)
+    "https://usdf-rsp-dev.slac.stanford.edu/river", session=session)
 
 job = service.run_async("SELECT TOP 10 * FROM ssp.dia_source_dp1")
 print(job.to_table())
@@ -201,7 +205,7 @@ Two parts:
 
 - a **backend** on `sdfiana035`: the ClickHouse server, the ingest tooling, and
   the catalog store. All writes happen here.
-- the **service**: the `mppdb` Phalanx application on `usdf-rsp-dev`. It provides
+- the **service**: the `river` Phalanx application on `usdf-rsp-dev`. It provides
   the TAP API and the web UI. It reads the backend and owns no data.
 
 ```{mermaid}
@@ -211,7 +215,7 @@ flowchart TB
     CH[("ClickHouse 26.6<br/>dp2 · ppdb · ssp<br/>TAP_SCHEMA + registries")]
     ING --> CH
   end
-  SVC["mppdb Phalanx app · usdf-rsp-dev<br/>/mppdb"]
+  SVC["river Phalanx app · usdf-rsp-dev<br/>/river"]
   U["users: console · TOPCAT · pyvo"]
   CH -- "read-only, mppdb_ro" --> SVC
   SVC --> U
@@ -370,7 +374,7 @@ The other half of the requirement: queries must return quickly at these row
 counts. What makes that possible is that each table is physically sorted on the
 key its queries filter by, so the engine reads a slice rather than scanning.
 
-- `mppdb.*` and `ppdb.*` are sorted on **`hpix29`**, a HEALPix index, with
+- `dp2.*` and `ppdb.*` are sorted on **`hpix29`**, a HEALPix index, with
   `cx`/`cy`/`cz` alongside. ADQL `CONTAINS(POINT(...), CIRCLE(...))` is rewritten
   onto that index, so a cone reads only the relevant ranges. `hpix29` is hidden
   from the schema browser deliberately — users never write it.
@@ -497,16 +501,16 @@ mode-600 secret files.
 #### The Phalanx application
 
 Provides the TAP API and the web UI. Reads the backend, owns no data. Defined in
-`applications/mppdb/`, currently image `ghcr.io/mjuric/mppdb:sha-35bd883`.
+`applications/river/`, currently image `ghcr.io/mjuric/mppdb:sha-7570146`.
 
 | aspect | how |
 |---|---|
 | auth | `GafaelfawrIngress`, scope `read:tap`; the service trusts the username header the ingress injects and creates the account on first sight |
-| path | `/mppdb`, prefix stripped before the pod; the app adds it back when generating URLs |
+| path | `/river`, prefix stripped before the pod; the app adds it back when generating URLs |
 | database credential | `mppdb_ro`: SELECT on `dp2`, `mppdb`, `ppdb`, `ssp`, `TAP_SCHEMA`, `system.parts`. The `mppdb` grant is unused since the retirement but **deliberately retained while the new shape soaks**: revoking it is the one step that would turn rolling the retirement back from a chart sync into a chart sync plus a backend grant, and it costs nothing to keep (read-only, and the credential is only usable by clients that already reach the node) |
 | state | 20 GiB `wekafs` ReadWriteOnce volume at `/data` |
 | replicas | exactly one, `strategy: Recreate` — the state engine is single-writer and two writers corrupt `state.db` |
-| secrets | hand-created: `mppdb` (database credential) and `mppdb-pull` (registry token) |
+| secrets | hand-created: `river` (database credential) and `river-pull` (registry token) |
 | catalog | loaded from the store at startup, refreshed by `SIGHUP`, never by redeploy |
 
 :::{important}
@@ -526,13 +530,12 @@ service reports.
 The service side needs no credentials:
 
 ```
-curl -s https://usdf-rsp-dev.slac.stanford.edu/mppdb/catalog
+curl -s https://usdf-rsp-dev.slac.stanford.edu/river/catalog
 ```
 
 ```json
-{"generation": 15, "loaded_at": "…",
- "schemas": {"dp2": "94b26ba7…", "mppdb": "46b4daa8…",
-             "ppdb": "bcc3d3f9…", "ssp": "edfb9aa7…"}}
+{"generation": 20, "loaded_at": "…",
+ "schemas": {"dp2": "43ebc9db…", "ppdb": "6d4cc61d…", "ssp": "3d76160e…"}}
 ```
 
 The store side is one query, using the service's own read-only credential:
@@ -572,7 +575,7 @@ mppdb catalog show
 Then make the service pick it up:
 
 ```
-kubectl -n mppdb exec deploy/mppdb -- mppdb reload --wait
+kubectl -n river exec deploy/river -- mppdb reload --wait
 ```
 
 `reload --wait` polls a target captured before the signal, so a concurrent publish
