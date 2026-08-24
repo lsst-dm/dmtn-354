@@ -62,7 +62,7 @@ SSP-specific. Three datasets are in scope:
 |---|---|
 | `ssp` | Solar System Processing — the eligible-source working set |
 | `ppdb` | developing the SSP daily data products pipeline |
-| `dp2` *(planned)* | data-release analytics, loadable as soon as DP2 exists |
+| `dp2` *(planned)* | data-release analytics, loadable as soon as DP2 exists; the console demo will move here |
 
 `ppdb` is there to support the pipeline that will produce `sssource`, `ssobject`
 and `nearby_sso` for the Prompt Products Database, developed at
@@ -96,6 +96,13 @@ detection counts, light curves, solar-system objects, and MPC orbital elements.
 Notebooks here speak ADQL rather than Python. Cells run top to bottom and remember
 what came before, and you can add plot cells and markdown cells alongside the
 queries.
+
+:::{important}
+The demo currently queries the `mppdb` database. When `dp2` is loaded it will move
+there, largely unchanged — the one difference being that `DiaObjectLast` goes away
+and `DiaObject` takes its place. Examples in this note that use
+`mppdb.DiaObjectLast` are tied to the current import for the same reason.
+:::
 
 For scripted access you need a token. Mint one in the RSP token page
 (`/settings/tokens/new`, scope `read:tap` only) and save it:
