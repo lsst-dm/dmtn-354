@@ -4,8 +4,8 @@
 mppdb is a SQL analytics database for Rubin catalog data, with a TAP 1.1 service
 providing an ADQL/TAP API and a web UI over it. It holds **120 billion rows**
 across three databases on one ClickHouse server at the USDF, with a fourth of
-**91 billion** loading, and you query it from TOPCAT, pyvo, or its own web
-console.
+**91 billion** loaded on the backend but not yet served here, and you query it
+from TOPCAT, pyvo, or its own web console.
 
 It is fast enough to use interactively at that scale. Indexed lookups return in
 **a fraction of a second**, aggregates over a billion rows in **2–12 seconds**,
@@ -78,17 +78,19 @@ lands, at which point `DiaObjectLast` goes away and `DiaObject` takes its place.
 | `ssp` | per-visit source catalogs for Solar System Processing — eleven tables, one per processing run | 93.77 B |
 | `ppdb` | a static snapshot of the Prompt Products Database | 48.70 M |
 
-A fourth, `dp2`, is **being loaded and is not queryable yet** — `FROM dp2.Source`
-fails with `unknown schema 'dp2'`.
+A fourth, `dp2`, finished loading on the backend on 2026-08-24 — thirteen tables,
+91.44 B rows — but **this deployment does not serve it yet**, so `FROM dp2.Source`
+fails with `unknown schema 'dp2'`. Serving it takes a grant on the backend and a
+config change here.
 
 Qualify table names: `mppdb.DiaSource`, `ssp.source_nv`. Unqualified names
 resolve to `mppdb`, so `FROM DiaObjectLast` works and `FROM source_nv` does not.
 
 :::{important}
 **"DP2" means three different things here.** `mppdb` is a *prerelease* DP2 import
-and is what everything queries today. `dp2` is the *final* release, still loading.
-`ssp.source_dp2` and `ssp.dia_source_dp2` are per-visit source tables extracted
-from DP2.
+and is what everything queries today. `dp2` is the *final* release, complete on the
+backend but not yet served here. `ssp.source_dp2` and `ssp.dia_source_dp2` are
+per-visit source tables extracted from DP2.
 
 `dp2` is not simply a bigger `mppdb`: it is thirteen data-release products
 (~91.4 B rows) whose three largest — `ForcedSource`, `ForcedSourceOnDiaObject`,
@@ -215,7 +217,7 @@ when reloaded — see *Operating the service*.
 ### The data: provenance and lifecycle
 
 **`mppdb`** is the original science import: DP2 prompt products — a **prerelease**
-of the release now loading as `dp2` — mapped onto a curated registry generated
+of the release now shipped as `dp2` — mapped onto a curated registry generated
 from the vendored Felis `apdb.yaml`. Datatypes, units,
 UCDs and descriptions come from Felis; `hpix29`/`cx`/`cy`/`cz` spatial columns,
 principal flags and foreign keys were added. The three large DIA tables came from
@@ -254,14 +256,21 @@ Loads run on `sdfiana035` only, because staging goes through the ClickHouse
 server's node-local `user_files` directory.
 
 :::{important}
-A fourth database, `dp2` — thirteen DP2 release products, about 91.4 B rows — is
-**loading now**: the three largest tables are in (`ForcedSource` 44.73 B,
-`ForcedSourceOnDiaObject` 24.26 B, `Source` 17.57 B, 86.55 B together as of
-2026-08-24) and the remaining ten are pending. It is not yet granted to the
-service's read-only user, so it is not queryable through TAP. When it is complete
-it takes over from `mppdb`, and the timings in this note should be re-measured
-against it. `ssp`'s ingest configs, loads and catalog content are owned by the
-ssp-submit project, not by the service.
+**`dp2` shipped on 2026-08-24**: thirteen DP2 release tables, **91.44 B rows**,
+Felis-named and `hpix29`-ordered — `Object`, `Source`, `DiaSource`, `DiaObject`,
+`ForcedSource`, `ForcedSourceOnDiaObject`, `Visit`, `CcdVisit`, `SSObject`,
+`SSSource`, `mpc_orbits`, `object_shear_all`, `isolated_star_stellar_motions`. The
+catalog store now holds four documents at generation 15, and the primary
+deployment serves all four.
+
+**This deployment still serves three.** Whether a front-end serves `dp2` is its
+own `[databases]` decision, per the authorization-boundary rule: `mppdb_ro` has no
+`SELECT` on `dp2`, so the grant comes first and the config change second. Until
+both happen, `dp2` is invisible here. When it does take over from `mppdb`, the
+timings in this note should be re-measured against it.
+
+`ssp`'s ingest configs, loads and catalog content are owned by the ssp-submit
+project, not by the service.
 :::
 
 ### Ingest and query performance
