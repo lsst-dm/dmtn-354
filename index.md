@@ -135,6 +135,22 @@ functions including `SUBSTRING`; `ORDER BY` on a select-list alias (write
 `ORDER BY COUNT(*) DESC`, not `ORDER BY n_dia DESC`); and
 `REGION`/`AREA`/`CENTROID`/`COORD1`/`COORD2`/`COORDSYS`.
 
+:::{warning}
+**A query carries at most about 1,000 literal values.** With `TAP_UPLOAD`
+unsupported, an explicit `id IN (…)` is the obvious substitute, and it works —
+up to a point. Every literal becomes a typed ClickHouse query parameter sent as
+an HTTP form field, and the server caps those at 1,000 (`http_max_fields`).
+Measured: 1,000 ids succeed, 1,200 fail with
+`Poco::Exception … HTML Form Exception: Too many form fields`, which says nothing
+about ids or limits.
+
+The ceiling is on the *count* of literals, not the length of the query — a query
+can be tens of kilobytes of text and be fine. Beyond that, the transport limits
+bite well before ClickHouse's own `max_query_size` (256 KiB): a `GET /sync` URL
+is refused with HTTP 400 somewhere past 50 kB of query text, and a `POST` body
+fails around 250 kB.
+:::
+
 Supported and easy to assume otherwise: joins, **including across databases**;
 `GROUP BY` and `HAVING`; `POINT`, `CIRCLE`, `POLYGON`, `BOX`, `CONTAINS`,
 `INTERSECTS`, `DISTANCE`; and the usual numeric functions. Fluxes are nJy, so
