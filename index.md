@@ -4,9 +4,9 @@
 mppdb is a SQL analytics database for Rubin catalog data, with a TAP 1.1 service
 in front of it. It holds about 120 billion rows across three databases on one
 ClickHouse server at the USDF, and you query it in ADQL from TOPCAT, pyvo, or its
-own web console. It exists because Rubin produces catalog datasets faster than it
-gains places to analyse them. The first half of this note is for people using the
-service; the second half is for people running it.
+own web console. It exists to give Solar System Processing — and Rubin catalog QA
+generally — somewhere to run SQL across a whole dataset. The first half of this
+note is for people using the service; the second half is for people running it.
 ```
 
 ## Scope and status
@@ -28,44 +28,52 @@ wrong. Believe the box over the surrounding text.
 :::
 
 :::{warning}
-Row counts here were measured on 2026-08-23. The `ssp` database grew from 22 to 94
-billion rows in the six days before that. Re-query rather than trusting a number
-in this note; *Operating the service* shows how.
+Row counts here were measured on 2026-08-24. The `ssp` database grew from 22 to 94
+billion rows in the preceding week. Re-query rather than trusting a number in this
+note: `SELECT COUNT(*) FROM ssp.source_nv` is read from metadata and returns in
+about 0.2 s.
 :::
 
 # Part I — Using the service
 
 ## What mppdb holds, and why it exists
 
-Four databases on one ClickHouse server, queried in ADQL:
+There are more Rubin catalog datasets than there are places to run SQL against
+them. They live in Butler collections and file exports. That works for pipelines;
+it does not work for ad-hoc queries across a whole dataset. The immediate driver
+was Solar System Processing, which needs every source that could be linked into an
+asteroid discovery in one queryable table rather than spread across dozens of
+collections — some of which no longer exist upstream.
+
+The service gives you two things: a **TAP 1.1 interface**, so standard VO tools
+work without anything bespoke, and a **web console** for finding out what is
+actually in these datasets.
+
+Three databases are queryable today:
 
 | database | what it holds | rows |
 |---|---|---|
-| `ssp` | per-visit source catalogs for Solar System Processing — eleven tables, one per processing run | 93.77 B |
 | `mppdb` | DP2 **prerelease** prompt products: DIA sources and objects, solar-system objects, MPC orbits | 25.74 B |
+| `ssp` | per-visit source catalogs for Solar System Processing — eleven tables, one per processing run | 93.77 B |
 | `ppdb` | a static snapshot of the Prompt Products Database — `DiaObject`, `DiaSource`, `DiaForcedSource` | 48.70 M |
-| `dp2` | the final DP2 release — **being loaded now**, will take over from `mppdb` | 86.55 B, 3 of 13 tables |
+
+A fourth, `dp2`, is **being loaded and is not queryable yet** — `FROM dp2.Source`
+fails with `unknown schema 'dp2'`. It is not granted to the service's read-only
+user until the load finishes.
 
 :::{important}
-**"DP2" means three different things here**, which is worth untangling once.
-`mppdb` is a *prerelease* DP2 import and is what everything below queries today.
-`dp2` is the *final* release, loading as this is written; it is similar to `mppdb`
-— comparable row counts, some columns different and fewer — and will replace it.
-Separately, `ssp.source_dp2` and `ssp.dia_source_dp2` are per-visit source tables
-extracted from DP2. Timings in this note were measured against `mppdb` and should
-be re-run once `dp2` is in place.
+**"DP2" means three different things here.** `mppdb` is a *prerelease* DP2 import
+and is what everything below queries. `dp2` is the *final* release, still loading.
+`ssp.source_dp2` and `ssp.dia_source_dp2` are per-visit source tables extracted
+from DP2.
+
+`dp2` is **not** simply a bigger `mppdb`: it is thirteen DP2 release products
+(~91.4 B rows) whose three largest are `ForcedSource`, `ForcedSourceOnDiaObject`
+and `Source` — data-release tables that `mppdb` does not have at all. Where the
+two do overlap, on the DIA prompt products, the row counts are comparable and the
+columns differ slightly. Timings in this note were measured against `mppdb` and
+should be re-measured once `dp2` is queryable.
 :::
-
-Rubin produces catalog datasets faster than it gains places to analyse them. They
-live in Butler collections and file exports, which suits pipelines and not
-questions like "give me every row matching this, across everything, now". The
-immediate driver was Solar System Processing, which needs every source that could
-be linked into an asteroid discovery in one queryable table rather than spread
-across dozens of collections — some of which no longer exist upstream.
-
-The service on top does two things: it provides a **TAP 1.1 interface**, so
-standard VO tools work without anything bespoke, and a **web console** for finding
-out what is actually in these datasets.
 
 ## Getting started
 
@@ -73,14 +81,19 @@ Open <https://usdf-rsp-dev.slac.stanford.edu/mppdb/ui/>. Rubin SSO logs you in a
 your account is created on first visit. Anyone who can log in to `usdf-rsp-dev`
 can query.
 
+The console has a **schema browser** in the left sidebar: it lists every database,
+its tables and their columns with units and descriptions. It is the fastest way to
+answer "what is this column", and it is the only place some of that information
+exists.
+
 **Start with the demo notebook.** Every account gets one, *Demo:
 Sky/Visit/Light Curve*: sixteen cells that begin with the whole sky, sort down to
 one active object, pull its light curve, then plot every detection from a single
 visit. Notebooks here speak ADQL, not Python; cells run top to bottom and remember
 what came before, and you can add plot and markdown cells.
 
-They also support `{{ }}` references, which feed a value from one cell into the
-next query. If a cell named `many` returned a table, the next cell can say:
+Cells can also feed each other. Give a cell a name in its header, then reference
+its result from a later cell with `{{ }}`. If a cell named `many` returned a table:
 
 ```text
 SELECT ra, dec, band, visit, midpointMjdTai, psfFlux, psfFluxErr
@@ -88,11 +101,14 @@ FROM mppdb.DiaSource
 WHERE diaObjectId = {{ many.diaObjectId[0] }}
 ```
 
+**The console runs every query asynchronously**, so console queries get the 3600 s
+budget rather than the 60 s one. The 60 s limit below applies when you call `/sync`
+yourself, including `pyvo`'s `search()`.
+
 :::{important}
 The demo queries `mppdb` today. When `dp2` is loaded it will move there, largely
 unchanged, except that `DiaObjectLast` goes away and `DiaObject` takes over its
-role. Examples below that use `mppdb.DiaObjectLast` are tied to the current
-prerelease import for the same reason.
+role.
 :::
 
 For scripted access, mint a token at
@@ -103,125 +119,198 @@ For scripted access, mint a token at
 (umask 077; cat > ~/.mppdb.token)   # paste the token, press Enter, then Ctrl-D
 ```
 
+A token minted here is a Rubin RSP token scoped to `read:tap`; the service does
+not issue its own. Your preferences, quotas and job history, however, live in this
+service and are not shared with the rest of the RSP.
+
 ## Finding your way around the tables
 
 ### `ssp` — eleven tables, one per processing run
 
-Which table you want depends entirely on which processing run you care about. The
-row counts do not tell you that, and picking the biggest is a trap.
+Which table you want depends on which processing run you care about. The row
+counts do not tell you that, and picking the biggest is a trap.
 
-| table | rows | what it is |
-|---|---|---|
-| `source_daytime` | 43.54 B | single-visit star sources, LSSTCam Daytime AP reprocessing |
-| `source_dp2` | 20.66 B | single-visit sources, final DP2 release |
-| `source_nv` | 17.99 B | single-visit star sources, nightly validation |
-| `source_nv_orphaned` | 9.17 B | nightlyValidation-era sources recovered from scratch FITS; no upstream copy |
-| `dia_source_dp2_v30_0_0` | 1.26 B | DIA sources from a DP2 **prerelease — superseded** |
-| `dia_source_dp2` | 1.00 B | DIA sources, final DP2 release |
-| `dia_source_prompt` | 118 M | DIA sources, LSSTCam prompt processing |
-| `dia_source_rfl` | 16.9 M | DIA sources, DRP FL reprocessing (`w_2025_19`) |
-| `dia_source_dp1_48666` | 5.3 M | earlier DP1 test processing — the run the first asteroids were found in |
-| `dia_source_dp1` | 3.09 M | DIA sources, final DP1 release |
-| `dia_source_2025lost` | 70 | recovered from a submitted ADES file; no upstream copy |
+| table | rows | cols | id | position | time | flux |
+|---|---|---|---|---|---|---|
+| `source_daytime` | 43.54 B | 23 | `id` | **`coord_ra`/`coord_dec`** | `mjd` | **instrumental only** |
+| `source_dp2` | 20.66 B | 21 | `sourceId` | `ra`/`dec` | `mjd` | `psfFlux` |
+| `source_nv` | 17.99 B | 64 | `sourceId` | `ra`/`dec` | `mjd` | `psfFlux` |
+| `source_nv_orphaned` | 9.17 B | 20 | `sourceId` | `ra`/`dec` | `mjd` | `psfFlux` |
+| `dia_source_dp2_v30_0_0` | 1.26 B | 96 | `diaSourceId` | `ra`/`dec` | `midpointMjdTai` | `psfFlux` |
+| `dia_source_dp2` | 1.00 B | 96 | `diaSourceId` | `ra`/`dec` | `midpointMjdTai` | `psfFlux` |
+| `dia_source_prompt` | 118 M | 96 | `diaSourceId` | `ra`/`dec` | `midpointMjdTai` | `psfFlux` |
+| `dia_source_rfl` | 16.9 M | 89 | `diaSourceId` | `ra`/`dec` | `midpointMjdTai` | `psfFlux` |
+| `dia_source_dp1_48666` | 5.3 M | 87 | `diaSourceId` | `ra`/`dec` | `midpointMjdTai` | `psfFlux` |
+| `dia_source_dp1` | 3.09 M | 89 | `diaSourceId` | `ra`/`dec` | `midpointMjdTai` | `psfFlux` |
+| `dia_source_2025lost` | 70 | 18 | `diaSourceId` | `ra`/`dec` | `midpointMjdTai` | `psfFlux` |
+
+**These tables are not interchangeable.** Three differences will each break a
+query you copied from one table to another:
+
+- `source_daytime` uses **`coord_ra`/`coord_dec`**; every other table uses
+  `ra`/`dec`. A cone search written for `source_nv` fails on `source_daytime`
+  with `UNKNOWN_COLUMN`.
+- The `source_*` tables timestamp with `mjd`; the `dia_source_*` tables use
+  `midpointMjdTai`.
+- **`source_daytime` has no calibrated flux at all** — only
+  `base_PsfFlux_instFlux` and `slot_CalibFlux_instFlux`, which are
+  *instrumental*, not nJy. Averaging "flux" across `ssp` tables mixes units
+  silently.
 
 :::{warning}
-Note rows five and six. `dia_source_dp2_v30_0_0` is a **superseded prerelease** and
-is *larger* than `dia_source_dp2`, the final release. Choosing by row count gets
-you the wrong data with no warning.
+**Quality flags exist in almost none of these tables.** `detect_isPrimary` is in
+**`source_nv` only**. So in `source_dp2` (20.66 B, the obvious pick for "final
+DP2") and `source_daytime` (43.54 B, the biggest table here) **you cannot cut on
+primary-ness at all** — deblended parent/child duplicates cannot be removed.
+
+| table | `detect_isPrimary` | `sky_source` | `pixelFlags_*` |
+|---|---|---|---|
+| `source_nv` | yes | yes | 12 |
+| `source_daytime` | — | yes | — |
+| `source_dp2` | — | yes | — |
+| `source_nv_orphaned` | — | — | — |
+| `dia_source_*` (most) | — | — | 18–20 |
+| `dia_source_2025lost` | — | — | — |
 :::
 
-Every table's full description — naming the collection and run it came from — is in
-the schema browser and in `TAP_SCHEMA.tables`.
+`dia_source_dp2_v30_0_0` is a **superseded prerelease** and is *larger* than
+`dia_source_dp2`, the final release. Choosing by row count gets you the wrong data
+with no warning.
 
-### `mppdb` — twelve tables
+`ssp.source_dp2` holds 20.66 B rows while `dp2.Source` holds 17.57 B. They are
+nominally the same data from the same release; the difference is not explained
+anywhere, so treat `ssp.source_dp2` as the SSP working copy rather than as an
+authoritative count of DP2 sources.
 
-`DiaSource`, `DiaObject`, `DiaObjectLast`, `DiaForcedSource`,
-`DiaObject_To_Object_Match`, `DetectorVisitProcessingSummary`, `SSObject`,
-`SSSource`, `mpc_orbits`, `current_identifications`, `numbered_identifications`,
-`metadata`.
+Every table's full description — naming the collection and run it came from — is
+in the schema browser and in `TAP_SCHEMA.tables`.
 
-Three of those repay knowing about:
+### `mppdb` — twelve tables, four of them empty
 
-**`DiaObject` versus `DiaObjectLast`.** `DiaObject` is version *history*: it
-carries `validityStartMjdTai` and `validityEndMjdTai`, and can hold several rows
-per `diaObjectId`. Joining it without filtering on validity silently multi-counts
-objects. `DiaObjectLast` holds one row per object. Use `DiaObjectLast` unless you
-specifically want history.
+| table | rows | |
+|---|---|---|
+| `DiaForcedSource` | 24.26 B | forced photometry at every object position |
+| `DiaSource` | 1.00 B | single-epoch difference-image detections |
+| `DiaObject` | 232 M | objects, **with photometry**, version-history rows |
+| `DiaObjectLast` | 232 M | objects, current version only, positions only |
+| `SSSource` | 8.14 M | per-detection solar-system quantities and ephemeris residuals |
+| `DetectorVisitProcessingSummary` | 5.15 M | per-visit, per-detector image quality |
+| `mpc_orbits` | 1.51 M | MPC orbital elements |
+| `SSObject` | 299 K | solar-system objects, phase-curve fits (80 columns) |
+| `DiaObject_To_Object_Match` | **0** | empty |
+| `current_identifications` | **0** | empty |
+| `numbered_identifications` | **0** | empty |
+| `metadata` | **0** | empty |
+
+:::{warning}
+**Four tables are empty.** They are advertised, they have schemas, and they
+return nothing. In particular `numbered_identifications` is where asteroid numbers
+and names would live, so **you cannot look an object up by number or name** —
+`(24) Themis` is not findable. Use the unpacked provisional designation
+(`mpc_orbits.designation`, `SSSource.designation`), e.g. `'2002 FJ36'`.
+:::
+
+**`DiaObject` versus `DiaObjectLast`** matters more than the names suggest.
+`DiaObjectLast` has ten columns — ids, position, source counts — and **no
+photometry**. `DiaObject` has 87, including `u_psfFluxMean` through
+`y_psfFluxMean` and their errors. So object-level photometry QA must use
+`DiaObject`.
+
+`DiaObject` carries version history: `validityStartMjdTai`/`validityEndMjdTai`,
+and several rows per `diaObjectId`. Joining it without filtering on validity
+multi-counts objects. The fix is one predicate — `validityEndMjdTai` is NULL on
+the current version:
+
+```sql
+WHERE validityEndMjdTai IS NULL
+```
 
 **`DetectorVisitProcessingSummary`** is the per-visit, per-detector image-quality
-table — 52 columns including `seeing`, `skyBg`, `zeroPoint`, `psfSigma`,
-`astromOffsetMean`, `nPsfStar`. It is what you join against when asking whether a
-detection anomaly tracks the observing conditions.
-
-**`mpc_orbits.designation` is the unpacked provisional designation** (e.g.
-`2008 AB`), not a number or a name. Numbers and names live in
-`numbered_identifications` (`permid`, `iau_designation`, `iau_name`), so looking up
-"(24) Themis" needs a join.
-
-`DiaObject_To_Object_Match` maps `diaObjectId` to `objectId` — but no `Object`
-table is loaded here, so the other side of that join does not exist yet.
+table — 52 columns including `seeing` (arcsec), `skyBg` (adu), `zeroPoint`,
+`psfSigma`, `astromOffsetMean`, `nPsfStar`. It is what you join against when
+asking whether a detection anomaly tracks the observing conditions.
 
 ### Column meanings
 
-`mppdb` and `ppdb` columns carry units, UCDs and descriptions from Felis; the
-schema browser and `TAP_SCHEMA.columns` show them:
+`mppdb` and `ppdb` columns carry units, UCDs and descriptions from Felis, visible
+in the schema browser and in `TAP_SCHEMA.columns`:
 
 ```sql
 SELECT column_name, datatype, unit, ucd, description
 FROM TAP_SCHEMA.columns WHERE table_name = 'mppdb.DiaSource'
 ```
 
+Fluxes are **nJy**, so magnitudes are `-2.5 * LOG10(psfFlux) + 31.4`.
+
 :::{important}
-**`ssp` columns have no descriptions or units** — 655 columns, all blank. The names
-come straight from the source parquet exports, which are the Butler
+**`ssp` columns have no descriptions or units** — 655 columns, all blank. The
+names come from the source parquet exports, which are the Butler
 `sourceTable`/`diaSourceTable` columns, so the Science Pipelines schema is the
-reference for what they mean. This includes the quality flags
-(`detect_isPrimary`, `sky_source`, `calib_psf_used`, `pixelFlags_*`,
-`invalidPsfFlag`), which behave as they do in the pipelines.
+reference for what they mean. Table-level descriptions do exist.
 :::
+
+Two things about values, both of which change what a comparison means:
+
+- **NaN became NULL on ingest.** Anywhere a pipeline wrote NaN, `ssp` holds NULL.
+  `AVG` skips NULLs, and `x > 0` is neither true nor false for them.
+- **Flags are nullable booleans.** `isDipole = 0` works, as does `= 1`; but a NULL
+  flag satisfies neither, so `WHERE isDipole = 0` silently drops rows where the
+  flag was never set.
 
 ## Writing queries
 
 **Qualify table names**: `mppdb.DiaSource`, `ssp.source_nv`, `ppdb.DiaObject`.
-Only the default database resolves unqualified names.
+Unqualified names resolve to **`mppdb`** — `FROM DiaObjectLast` works,
+`FROM source_nv` does not.
 
 ### What is fast
 
 Each table is physically sorted on one key. A query is fast when its filter
-matches that key, because the engine reads a slice instead of the whole table. In
-terms of what you write:
+matches that key, because the engine reads a slice instead of scanning. In terms
+of what you write:
 
-| this is fast | on |
+| this prunes | on |
 |---|---|
-| `WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', …)) = 1` | `mppdb.*` and `ppdb.*` spatial tables — they are sorted by sky position |
+| `WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', …)) = 1` | `mppdb.*` and `ppdb.*` — sorted by sky position |
 | `WHERE <idcol> = …` or `BETWEEN` on the id | all `ssp` tables — sorted by id |
-| `COUNT(*)` with no `WHERE` | anything — it is read from metadata, not scanned |
-| `GROUP BY band`, `WHERE band = 'r'` | anything — `band` is a low-cardinality column |
 | a join on **both** `visit` and `detector` | `mppdb.DiaSource` × `DetectorVisitProcessingSummary` |
+| `COUNT(*)` with no `WHERE` | anything — read from metadata, not scanned |
 
-| this is slow | why |
+Everything else scans. Scanning is not always slow — `GROUP BY band` over
+`DiaSource` is a 2.2 s scan, because `band` is a low-cardinality column and the
+table is 1 B rows — but it does not prune, and the cost grows with the table:
+
+| this scans | measured |
 |---|---|
-| any cone search on `ssp.*` | the spatial columns exist so the query is *correct*, but nothing prunes it: expect a full scan, minutes on tens of billions of rows |
-| `WHERE visit = …` on `ssp.*` | there is a `visit` column but the table is not organised by it, so this scans. The fast path is an explicit id range, and ADQL here has no bitwise or integer-division functions to compute one from a visit number — so in practice, filter by id or accept the scan |
-| a join on `visit` alone | fans out across all detectors; the same query joined on `visit` **and** `detector` finished in 2.8 s where the `visit`-only version hit the 60 s limit |
+| cone search on `ssp.*` | **311 s** for a 0.1° cone on `source_nv` (18 B rows, 46,616 matched). Correct, but nothing prunes it — **async only** |
+| `WHERE visit = …` on `ssp.*` | 5.1 s on `source_nv`. There is a `visit` column, but the table is organised by id |
+| a join on `visit` alone | fans out across all detectors; the same query joined on `visit` **and** `detector` took 2.8 s where the `visit`-only version hit the 60 s limit |
 
-The id column differs per `ssp` table: `id` for `source_daytime`, `sourceId` for
-`source_nv`, `source_dp2` and `source_nv_orphaned`, `diaSourceId` for all seven
-`dia_source_*` tables.
+The id column differs per `ssp` table — `id`, `sourceId` or `diaSourceId`, per the
+table above.
+
+**Getting an id range from a visit.** Ids are packed per visit, but the packing is
+not documented, and ADQL here has no bitwise operators to unpack it. Ask the
+database once:
+
+```sql
+SELECT MIN(sourceId) AS lo, MAX(sourceId) AS hi
+FROM ssp.source_nv WHERE visit = 2026051200854
+```
+
+That costs one scan (4.5 s), and then every query against that visit is indexed:
+
+```sql
+SELECT COUNT(*) FROM ssp.source_nv
+WHERE sourceId BETWEEN 26278442525786120 AND 26278442624354608
+  AND detect_isPrimary = 1
+```
+
+**0.1 s**, versus 5.1 s for the same count written as `WHERE visit = …`. Keep the
+range if you are going to ask more than one question about a visit.
 
 You never write `hpix29` yourself. It is the spatial sort key, it is hidden from
 the schema browser deliberately, and `CONTAINS(...)` is what puts it to work.
-
-Measured against the live service, on `mppdb`:
-
-| query | time |
-|---|---|
-| cone search, `DiaObjectLast`, radius 0.5°, `TOP 1000` with no `ORDER BY` | 0.2 s — this is time to the *first* 1000 rows, not the full cone |
-| `COUNT(*)` on `ssp.source_nv` (17.99 B rows) | 0.2 s — metadata, not a scan |
-| id-ordered lookup, `ssp.dia_source_dp1` | 0.1 s |
-| visit/detector join with `GROUP BY`, 704 rows out | 2.8 s |
-| `GROUP BY band` with `AVG(snr)` over `DiaSource`, no cuts | 11.9 s |
-| the same aggregate with quality cuts | 10.4 s |
 
 ### Limits you will hit
 
@@ -229,38 +318,74 @@ Measured against the live service, on `mppdb`:
 |---|---|
 | rows returned, default | **50,000** |
 | rows returned, maximum | 2,000,000 |
-| sync query timeout | **60 s** |
-| async job timeout | 3600 s |
+| sync query timeout | **60 s** (`/sync` and `pyvo`'s `search()`) |
+| async job timeout | 3600 s (everything the console runs) |
 | results kept | 7 days |
 
 :::{warning}
 **Truncation at 50,000 rows is reported as success**, not as an error — the
-response carries an `OVERFLOW` status. If you run an aggregate and get exactly
-50,000 rows back, check for it before believing that is the whole answer.
+response carries an `OVERFLOW` status. If an aggregate returns exactly 50,000
+rows, check for it before believing that is the whole answer. In `pyvo` it is on
+the result's `QUERY_STATUS` info; in the console the job listing flags the job as
+overflowed. Raise `MAXREC` up to 2,000,000, or aggregate server-side instead.
 :::
 
-Use `/sync` for interactive work and `/async` for anything that might exceed 60
-seconds — an async job is queued, its results are spooled, and it survives a
-disconnect. In pyvo that is `run_async` rather than `search`.
+**`TOP n` without `ORDER BY` gives you whichever rows the engine reaches first**,
+not a sample. That is fine for looking at column values and wrong for anything
+statistical.
 
-**Not supported here**, and worth knowing before you assume you made a mistake:
+**Not supported.** If a query fails on one of these, it is the service, not you:
 
-- **`TAP_UPLOAD`** — you cannot upload a table to join against. There is no
-  workaround through the service today.
-- **`WITH` / common table expressions** — rejected as `UNSUPPORTED_ADQL`.
-- **Correlated subqueries.**
+- **`TAP_UPLOAD`** — no uploading a table to join against. For small match lists
+  an explicit `id IN (…)` works; a few thousand ids is fine, and past that the
+  query text itself becomes the problem.
+- **`WITH` / common table expressions**, and **correlated subqueries**.
+- **`CASE` expressions** and **`COUNTIF`** — so conditional counts need either two
+  queries or a `WHERE`-filtered one.
 - **`ORDER BY` on a select-list alias** — write `ORDER BY COUNT(*) DESC`, not
   `ORDER BY n_dia DESC`, which fails as `UNKNOWN_COLUMN`.
+- **String functions** — no `SUBSTRING`, no concatenation. You cannot slice a
+  designation server-side.
 - **`REGION`, `AREA`, `CENTROID`, `COORD1`, `COORD2`, `COORDSYS`**, and
-  region-in-region `CONTAINS` — point-in-region only.
-- Functions are an allowlist; `CAST` is restricted to scalar types.
+  region-in-region `CONTAINS`.
 
-Joins, `GROUP BY`, `HAVING`, aggregates and point-in-region `CONTAINS` all work.
+**Supported**, and easy to miss: joins, including **across databases**
+(`ssp.dia_source_dp1 JOIN mppdb.SSSource` works); `GROUP BY`, `HAVING`,
+aggregates; the geometry constructors `POINT`, `CIRCLE`, `POLYGON` and `BOX`, the
+predicates `CONTAINS` and `INTERSECTS`, and the scalar `DISTANCE`; and the
+numeric functions `ABS CEILING DEGREES EXP FLOOR LOG LOG10 MOD PI POWER RADIANS
+RAND ROUND SQRT TRUNCATE ACOS ASIN ATAN ATAN2 COS COT SIN TAN`. `CAST` is
+restricted to scalar types.
 
 ### Examples
 
+All timings below were measured on this service against `mppdb`.
+
+**Nightly solar-system linkage** — how many detections were linked to a
+solar-system object each night and band. This is the "is SSP working" query.
+`ssObjectId` is `0` for unlinked detections, not NULL, so `COUNT(ssObjectId)`
+would count everything. 7.5 s, 365 rows:
+
+```sql
+SELECT FLOOR(midpointMjdTai) AS night, band, COUNT(*) AS n_linked
+FROM mppdb.DiaSource
+WHERE ssObjectId != 0
+GROUP BY FLOOR(midpointMjdTai), band
+ORDER BY FLOOR(midpointMjdTai), band
+```
+
+Overall, 8,136,150 of 1,000,825,975 detections are linked — 0.81%, and it matches
+`SSSource`'s row count exactly. Drop the `WHERE` for the denominator per night.
+
+**What a table actually covers** — rows and time span per band, 2.2 s:
+
+```sql
+SELECT band, COUNT(*) AS n, MIN(midpointMjdTai) AS t0, MAX(midpointMjdTai) AS t1
+FROM mppdb.DiaSource GROUP BY band ORDER BY band
+```
+
 **Image quality against detection counts** — which visit/detector pairs threw
-anomalous numbers of r-band DIA detections, and does it track seeing or sky
+anomalous numbers of r-band detections, and does it track seeing or sky
 background? 2.8 s, 704 rows:
 
 ```sql
@@ -274,18 +399,31 @@ HAVING COUNT(*) > 5000
 ORDER BY COUNT(*) DESC
 ```
 
-**A cone search** — fast, because `DiaObjectLast` is sorted by position:
+**Objects with photometry in a cone** — `DiaObject`, current versions only.
+20.0 s, 23,536 rows:
 
 ```sql
-SELECT TOP 1000 diaObjectId, ra, dec, nDiaSources, lastDiaSourceMjdTai
-FROM mppdb.DiaObjectLast
-WHERE CONTAINS(POINT('ICRS', ra, dec),
-               CIRCLE('ICRS', 53.13, -28.10, 0.5)) = 1
+SELECT diaObjectId, ra, dec, nDiaSources,
+       g_psfFluxMean, r_psfFluxMean, i_psfFluxMean
+FROM mppdb.DiaObject
+WHERE validityEndMjdTai IS NULL
+  AND CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 53.13, -28.10, 0.5)) = 1
 ```
 
-**Detections per band, with quality cuts.** Without the cuts the mean is dominated
-by dipoles, streaks and edge artifacts — in g band the cuts take 175.7 M
-detections down to 1.4 M:
+**Solar-system astrometric residuals against the ephemeris** — the standard SSP QA
+plot. 4.6 s, 732 rows:
+
+```sql
+SELECT ss.diaSourceId, ds.midpointMjdTai, ds.band,
+       ss.ephOffsetAlongTrack, ss.ephOffsetCrossTrack, ss.phaseAngle
+FROM mppdb.SSSource AS ss
+JOIN mppdb.DiaSource AS ds ON ss.diaSourceId = ds.diaSourceId
+WHERE ss.designation = '2002 FJ36'
+ORDER BY ds.midpointMjdTai
+```
+
+**Detections per band with quality cuts**, 10.4 s. `reliability` is the
+real/bogus classifier score, declared nullable but with no NULLs today:
 
 ```sql
 SELECT band, COUNT(*) AS n_detections, AVG(snr) AS mean_snr
@@ -293,6 +431,24 @@ FROM mppdb.DiaSource
 WHERE reliability > 0.9 AND isDipole = 0
 GROUP BY band
 ORDER BY band
+```
+
+:::{warning}
+That cut is aggressive, not a default. Across the whole table, `reliability > 0.9`
+keeps 16.3 M of 1.0 B detections — 1.6%; `> 0.5` keeps 26.3 M. In g band the note's
+cuts take 175.7 M detections down to 1.4 M. Pick a threshold deliberately and say
+which one you used. Note also that `reliabilityVersion` exists, so scores are not
+comparable across runs with different classifier models, and that `reliability`
+does not remove streaks or edge artifacts — the `pixelFlags_*` columns do that.
+:::
+
+**A single visit from `ssp`**, using the id range from above. 0.2 s:
+
+```sql
+SELECT TOP 5 sourceId, ra, dec, mjd, psfFlux, band
+FROM ssp.source_nv
+WHERE sourceId BETWEEN 26278442525786120 AND 26278442624354608
+  AND detect_isPrimary = 1
 ```
 
 **A forced-photometry light curve** for one object:
@@ -304,36 +460,20 @@ WHERE diaObjectId = 744858242361853537
 ORDER BY midpointMjdTai
 ```
 
-**Solar-system astrometric residuals against the ephemeris** — the standard SSP QA
-plot. Run this async; it exceeded the sync limit when tested:
-
-```sql
-SELECT ss.diaSourceId, ds.midpointMjdTai, ds.band,
-       ss.ephOffsetAlongTrack, ss.ephOffsetCrossTrack, ss.phaseAngle
-FROM mppdb.SSSource AS ss
-JOIN mppdb.DiaSource AS ds ON ss.diaSourceId = ds.diaSourceId
-WHERE ss.designation = '2008 AB'
-ORDER BY ds.midpointMjdTai
-```
-
-**Orbital elements for a numbered object**, which needs the identification join:
-
-```sql
-SELECT n.permid, n.iau_name, o.a, o.q, o.e, o.i, o.epoch_mjd
-FROM mppdb.mpc_orbits AS o
-JOIN mppdb.numbered_identifications AS n
-  ON n.unpacked_primary_provisional_designation = o.designation
-WHERE n.permid = '24'
-```
-
-A crude main-belt box, if you want elements in bulk — a selection, not a
-definition:
+**Orbital elements in bulk**, a rough main-belt cut — a selection, not a
+definition of the main belt:
 
 ```sql
 SELECT TOP 1000 designation, a, q, e, i, argperi, node, epoch_mjd
 FROM mppdb.mpc_orbits
 WHERE a BETWEEN 2.1 AND 3.3 AND e < 0.25
 ```
+
+:::{warning}
+**809,795 of `mpc_orbits`' 1,505,545 rows have NULL `a`** — 54%. Any cut on `a`
+drops them silently. Check `COUNT(*)` with and without the element predicate
+before drawing a conclusion about population sizes.
+:::
 
 The console ships several of these ready to run.
 
@@ -377,7 +517,8 @@ until the service returns a 401, so expect the prompt to appear after your first
 action rather than up front. Give your token as the HTTP Basic *username*, with
 `x-oauth-basic` as the password.
 
-In **pyvo**:
+In **pyvo** — note `run_async`, not `search`, for anything that might take more
+than a minute:
 
 ```python
 import pyvo, requests
@@ -397,8 +538,14 @@ print(job.to_table())
 
 ## Things to know
 
-Your account, tokens, quotas and job history belong to this service; a token
-minted here works here.
+**This is a pilot on one node.** If the host reboots, ClickHouse does not come
+back on its own and every query fails until someone restarts it by hand. There is
+no replication and no backup of the databases.
+
+**Who to ask.** The service is run by the Solar System Pipelines group; mjuric
+owns it today. Report a wrong column, a missing table or an outage there, or file
+an issue against the mppdb repository. A named on-call owner is one of the things
+production would need and does not have yet.
 
 `ssp.SubmittableSources`, a view over all eleven `ssp` tables, is not advertised
 over TAP yet.
@@ -526,8 +673,11 @@ stage. Do not turn that into a rate comparison between the stages:
 - **Rows per minute is the wrong unit upstream.** It varies 60x across the DP2
   products (5.8–352 M rows/min), almost entirely with row width: one table is 1,225
   columns, another 29. Byte rate varies only about 4x (5.8–23.3 GB/min), so GB/min
-  is the honest upstream unit. Two products bracket it: `object_forced_source`,
-  44.7 G rows / 912 GB in 127 min; `source`, 17.6 G rows / 9.76 TB in 419 min.
+  is the honest upstream unit. The two fastest illustrate the difference:
+  `object_forced_source` at 44.7 G rows / 912 GB in 127 min is the fastest by rows
+  (352 M rows/min, 7.2 GB/min), while `source` at 17.6 G rows / 9.76 TB in 419 min
+  is the fastest by bytes (42 M rows/min, 23.3 GB/min). The low ends of both
+  ranges belong to the narrow, small products.
 
 **Incremental extension works at both stages**, which is what makes this
 sustainable. Downstream, an append loads only parts absent from the ledger and
