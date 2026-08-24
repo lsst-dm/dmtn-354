@@ -106,21 +106,6 @@ Two things in `dp2` will surprise you if you `SELECT *`: `Object` has **1,225
 columns**, and `mpc_orbits` carries a JSON blob of roughly **5.7 KB per row**.
 Name the columns you want.
 
-:::{important}
-**"DP2" names two different things here.** The `dp2` database is the DP2 data
-release itself — thirteen products, ~91.4 B rows, the largest being
-`ForcedSource`, `ForcedSourceOnDiaObject` and `Source`. Separately,
-`ssp.source_dp2` and `ssp.dia_source_dp2` are per-visit *source tables extracted
-from* DP2 for Solar System Processing, with different columns and a different
-sort key. Same release, different shape, different purpose.
-
-A third sense existed until 2026-08-24: a database called `mppdb`, a DP2
-prerelease that everything queried while `dp2` was loading. It has been retired.
-If you find a query or notebook referring to `mppdb.*`, it is from before the
-cutover and needs requalifying to `dp2.*` — the prompt-product tables correspond,
-except that `DiaObjectLast` is gone and `DiaObject` takes its role.
-:::
-
 ### Limits
 
 | limit | value |
