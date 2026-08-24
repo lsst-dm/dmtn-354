@@ -16,8 +16,13 @@ dataset goes from a Butler repository to a queryable table in **hours**, at abou
 **incrementally, in minutes**.
 
 It exists to give Solar System Processing — and Rubin catalog QA generally —
-somewhere to run SQL across a whole dataset. The first half of this note is for
-people using the service; the second half is for people running it.
+somewhere to run SQL across a whole dataset. Two of these databases back
+production work: `ssp` is what the solar-system group's MPC submissions are drawn
+from, and `ppdb` is where the solar-system tables delivered to Rubin's official
+Prompt Products Database will be built. The intent is therefore to keep the
+contents current — refreshed at least daily, and in near-real time as each night's
+data arrives. The first half of this note is for people using the service; the
+second half is for people running it.
 ```
 
 ## Scope and status
@@ -487,10 +492,21 @@ SELECT schema_name, generation, substring(sha256, 1, 10), published_at
 FROM TAP_SCHEMA.registries ORDER BY schema_name
 ```
 
-Equal generations and matching digests mean the service is current. A store
-generation ahead of the served one means a publish happened and the service has not
-reloaded. On the backend node, `mppdb catalog show` reports the same with
-provenance.
+Equal generations and matching digests mean the service is current. On the backend
+node, `mppdb catalog show` reports the same with provenance.
+
+**Read the digests, not the generation.** `generation` is global and monotonic
+across the whole store, so publishing *any* schema advances it for everyone. A
+service can be several generations behind while serving byte-identical content,
+because the publishes that moved the counter touched schemas it does not serve.
+That is the live state as this is written: the service reports generation 2 against
+a store at 15, and all three of its digests match the store's current documents
+exactly. The gap is entirely `dp2`, which this deployment does not serve.
+
+The practical rule: a digest mismatch on a served schema means reload now; a
+generation gap with matching digests means a reload would change nothing, and
+deferring it is the safer choice, since a reload also picks up anything else that
+has changed.
 
 #### After a catalog change
 
