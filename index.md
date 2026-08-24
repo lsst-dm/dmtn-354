@@ -339,13 +339,34 @@ The console ships several of these ready to run.
 
 ## Getting results out
 
-Async results can be retrieved as **VOTable, CSV or Parquet** — add
-`?FORMAT=csv` or `?FORMAT=parquet` when fetching a job's result. The service can
-also mint a **download link** for a result, which `curl`, `wget` or TOPCAT can
-fetch without your session.
+Results come back as **VOTable, CSV or Parquet** — pass `FORMAT=votable`, `csv` or
+`parquet` on `/sync`, or when fetching an async job's result. Those three are all
+there is: `FORMAT=fits`, `tsv` and `json` are rejected. Note that
+`/capabilities` advertises only the VOTable serialisations, so a strict VO client
+may not offer you CSV or Parquet even though the service will serve them.
 
-There is also a **Simple Cone Search** endpoint, `/scs/{table}?RA=&DEC=&SR=`, if
-you have an SCS client already.
+Parquet is the one to use for anything large — it is typed and compact, and
+`pandas.read_parquet` or `pyarrow` will read it directly.
+
+The console's Download menu mints a **capability link** for a completed job: a
+long random URL that `curl`, `wget` or TOPCAT can fetch with no token and no
+session. It is good for 8 hours, can be reused within that window, and dies if
+the service restarts. Convenient for handing a result to a collaborator; not
+something to put in a script that has to keep working.
+
+There is also a **Simple Cone Search** endpoint if you have an SCS client:
+
+```
+/scs?RA=53.13&DEC=-28.10&SR=0.05
+/scs/DiaObjectLast?RA=53.13&DEC=-28.10&SR=0.05
+```
+
+The table name is **unqualified and `mppdb`-only** — `/scs/mppdb.DiaObjectLast`
+fails with `unknown SCS table`, which is a confusing message for what is really a
+naming rule. Omit it and you get `DiaObjectLast`. `SR` is capped at **5 degrees**,
+and cones on `DiaSource` are **disabled** on this deployment because the table is
+too large to cone through. For anything SCS will not do, use ADQL with
+`CONTAINS`.
 
 ## TOPCAT and pyvo
 
