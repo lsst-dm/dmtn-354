@@ -3,8 +3,7 @@
 ```{abstract}
 mppdb is a SQL analytics database for Rubin catalog data, with a TAP 1.1 service
 providing an ADQL/TAP API and a web UI over it. It holds **120 billion rows**
-across three databases on one ClickHouse server at the USDF, with a fourth of
-**91 billion** loaded on the backend but not yet served here, and you query it
+across **four** databases on one ClickHouse server at the USDF, and you query it
 from TOPCAT, pyvo, or its own web console.
 
 It is fast enough to use interactively at that scale. Indexed lookups return in
@@ -72,8 +71,9 @@ Then use the console, which is built to be explored rather than documented:
 
 Two things about the console that are not visible from it: it runs **every query
 asynchronously**, so console queries get the 3600 s limit rather than the 60 s
-one; and the demo notebook currently queries `mppdb`, moving to `dp2` when that
-lands, at which point `DiaObjectLast` goes away and `DiaObject` takes its place.
+one; and the demo notebook still queries `mppdb` rather than `dp2`, which is a
+pending change, at which point `DiaObjectLast` goes away and `DiaObject` takes its
+place.
 
 ### What is in it
 
@@ -81,20 +81,24 @@ lands, at which point `DiaObjectLast` goes away and `DiaObject` takes its place.
 |---|---|---|
 | `mppdb` | DP2 **prerelease** prompt products: DIA sources and objects, solar-system objects, MPC orbits | 25.74 B |
 | `ssp` | per-visit source catalogs for Solar System Processing — eleven tables, one per processing run | 93.77 B |
+| `dp2` | the DP2 data release: thirteen tables, among them `Object`, `Source`, `ForcedSource` | 91.44 B |
 | `ppdb` | a static snapshot of the Prompt Products Database | 48.70 M |
 
-A fourth, `dp2`, finished loading on the backend on 2026-08-24 — thirteen tables,
-91.44 B rows — but **this deployment does not serve it yet**, so `FROM dp2.Source`
-fails with `unknown schema 'dp2'`. Serving it takes a grant on the backend and a
-config change here.
+`dp2` was added on 2026-08-24 and is the newest. Unlike `ssp` it is **sorted by
+sky position**, so cone and region searches are its indexed access path, where in
+`ssp` ids are indexed and cone searches are full scans.
+
+Two things in `dp2` will surprise you if you `SELECT *`: `Object` has **1,225
+columns**, and `mpc_orbits` carries a JSON blob of roughly **5.7 KB per row**.
+Name the columns you want.
 
 Qualify table names: `mppdb.DiaSource`, `ssp.source_nv`. Unqualified names
 resolve to `mppdb`, so `FROM DiaObjectLast` works and `FROM source_nv` does not.
 
 :::{important}
 **"DP2" means three different things here.** `mppdb` is a *prerelease* DP2 import
-and is what everything queries today. `dp2` is the *final* release, complete on the
-backend but not yet served here. `ssp.source_dp2` and `ssp.dia_source_dp2` are
+and is what most of this note's measurements used. `dp2` is the *final* release,
+served here since 2026-08-24. `ssp.source_dp2` and `ssp.dia_source_dp2` are
 per-visit source tables extracted from DP2.
 
 `dp2` is not simply a bigger `mppdb`: it is thirteen data-release products
@@ -191,7 +195,7 @@ Two parts:
 flowchart TB
   subgraph BACKEND["backend · sdfiana035 · apptainer sandbox"]
     ING["ingest: parquet / HATS / tapdump<br/>publishes data, then catalog"]
-    CH[("ClickHouse 26.6<br/>mppdb · ppdb · ssp<br/>TAP_SCHEMA + registries")]
+    CH[("ClickHouse 26.6<br/>dp2 · mppdb · ppdb · ssp<br/>TAP_SCHEMA + registries")]
     ING --> CH
   end
   SVC["mppdb Phalanx app · usdf-rsp-dev<br/>/mppdb"]
@@ -268,11 +272,13 @@ Felis-named and `hpix29`-ordered — `Object`, `Source`, `DiaSource`, `DiaObject
 catalog store now holds four documents at generation 15, and the primary
 deployment serves all four.
 
-**This deployment still serves three.** Whether a front-end serves `dp2` is its
-own `[databases]` decision, per the authorization-boundary rule: `mppdb_ro` has no
-`SELECT` on `dp2`, so the grant comes first and the config change second. Until
-both happen, `dp2` is invisible here. When it does take over from `mppdb`, the
-timings in this note should be re-measured against it.
+**This deployment serves it as of 2026-08-24.** Whether a front-end serves `dp2`
+is its own `[databases]` decision, per the authorization-boundary rule, and the
+order is fixed: `GRANT SELECT ON dp2.* TO mppdb_ro` on the backend first, then a
+`databases.dp2` entry in the chart, then a restart or reload. Skipping the grant
+would leave a service configured for a database it cannot read. When `dp2` takes
+over from `mppdb` as the note's reference database, the timings here should be
+re-measured against it — that has not been done yet.
 
 `ssp`'s ingest configs, loads and catalog content are owned by the ssp-submit
 project, not by the service.
@@ -454,7 +460,7 @@ Provides the TAP API and the web UI. Reads the backend, owns no data. Defined in
 |---|---|
 | auth | `GafaelfawrIngress`, scope `read:tap`; the service trusts the username header the ingress injects and creates the account on first sight |
 | path | `/mppdb`, prefix stripped before the pod; the app adds it back when generating URLs |
-| database credential | `mppdb_ro`: SELECT on `mppdb`, `ppdb`, `ssp`, `TAP_SCHEMA`, `system.parts` |
+| database credential | `mppdb_ro`: SELECT on `dp2`, `mppdb`, `ppdb`, `ssp`, `TAP_SCHEMA`, `system.parts` |
 | state | 20 GiB `wekafs` ReadWriteOnce volume at `/data` |
 | replicas | exactly one, `strategy: Recreate` — the state engine is single-writer and two writers corrupt `state.db` |
 | secrets | hand-created: `mppdb` (database credential) and `mppdb-pull` (registry token) |
@@ -481,8 +487,9 @@ curl -s https://usdf-rsp-dev.slac.stanford.edu/mppdb/catalog
 ```
 
 ```json
-{"generation": 2, "loaded_at": "…",
- "schemas": {"mppdb": "46b4daa8…", "ppdb": "bcc3d3f9…", "ssp": "edfb9aa7…"}}
+{"generation": 15, "loaded_at": "…",
+ "schemas": {"dp2": "94b26ba7…", "mppdb": "46b4daa8…",
+             "ppdb": "bcc3d3f9…", "ssp": "edfb9aa7…"}}
 ```
 
 The store side is one query, using the service's own read-only credential:
@@ -499,9 +506,11 @@ node, `mppdb catalog show` reports the same with provenance.
 across the whole store, so publishing *any* schema advances it for everyone. A
 service can be several generations behind while serving byte-identical content,
 because the publishes that moved the counter touched schemas it does not serve.
-That is the live state as this is written: the service reports generation 2 against
-a store at 15, and all three of its digests match the store's current documents
-exactly. The gap is entirely `dp2`, which this deployment does not serve.
+This is not hypothetical. Before `dp2` was served, this deployment sat at
+generation 2 against a store at 15 with all three of its digests matching the
+store's current documents exactly: the thirteen intervening generations were
+`dp2`'s per-table ingest publishes, none of which touched a schema it served.
+Reloading would have changed nothing. Adding `dp2` is what moved it to 15.
 
 The practical rule: a digest mismatch on a served schema means reload now; a
 generation gap with matching digests means a reload would change nothing, and
