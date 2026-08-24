@@ -497,7 +497,7 @@ Provides the TAP API and the web UI. Reads the backend, owns no data. Defined in
 |---|---|
 | auth | `GafaelfawrIngress`, scope `read:tap`; the service trusts the username header the ingress injects and creates the account on first sight |
 | path | `/river`, prefix stripped before the pod; the app adds it back when generating URLs |
-| database credential | `mppdb_ro`: SELECT on `dp2`, `mppdb`, `ppdb`, `ssp`, `TAP_SCHEMA`, `system.parts`. The `mppdb` grant is unused since the retirement but **deliberately retained while the new shape soaks**: revoking it is the one step that would turn rolling the retirement back from a chart sync into a chart sync plus a backend grant, and it costs nothing to keep (read-only, and the credential is only usable by clients that already reach the node) |
+| database credential | `mppdb_ro`: SELECT on `dp2`, `ppdb`, `ssp` and `TAP_SCHEMA`, plus `system.one` and `system.parts`. Nothing more — the grant matches the served set exactly |
 | state | 20 GiB `wekafs` ReadWriteOnce volume at `/data` |
 | replicas | exactly one, `strategy: Recreate` — the state engine is single-writer and two writers corrupt `state.db` |
 | secrets | hand-created: `river` (database credential) and `river-pull` (registry token) |
