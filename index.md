@@ -85,81 +85,6 @@ from DP2.
 DIA prompt products, row counts are comparable and columns differ slightly.
 :::
 
-### Things that will mislead you
-
-Everything above is discoverable by clicking around. This is not, and most of it
-will silently give you a wrong answer rather than an error.
-
-**Picking a table**
-
-- `ssp.dia_source_dp2_v30_0_0` (1.26 B) is a **superseded prerelease** and is
-  *larger* than the final `ssp.dia_source_dp2` (1.00 B). Choosing by row count
-  gets you the wrong data.
-- `ssp.source_dp2` holds 20.66 B rows where `dp2.Source` holds 17.57 B, nominally
-  from the same release. The difference is unexplained; treat `ssp.source_dp2` as
-  the SSP working copy, not an authoritative DP2 count.
-- **The eleven `ssp` tables are not interchangeable.** `source_daytime` uses
-  `coord_ra`/`coord_dec` where the rest use `ra`/`dec`; the `source_*` tables
-  timestamp with `mjd` and the `dia_source_*` tables with `midpointMjdTai`. A
-  query copied between them fails, or worse, does not.
-- **`source_daytime` has no calibrated flux** — only `base_PsfFlux_instFlux` and
-  `slot_CalibFlux_instFlux`, which are instrumental, not nJy. Averaging "flux"
-  across `ssp` tables mixes units silently.
-- **`detect_isPrimary` exists in `source_nv` only.** In `source_dp2` (20.66 B) and
-  `source_daytime` (43.54 B) — the two largest — you cannot cut on primary-ness at
-  all, so deblended parent/child duplicates cannot be removed.
-- **Four `mppdb` tables are empty**: `numbered_identifications`,
-  `current_identifications`, `metadata`, `DiaObject_To_Object_Match`. They are
-  advertised, have schemas, and return nothing. Asteroid numbers and names live in
-  the first of those, so **you cannot look an object up by number or name** — use
-  the unpacked provisional designation, e.g. `'2002 FJ36'`.
-- **`DiaObjectLast` has no photometry** — ten columns, ids and positions.
-  Object-level photometry is in `DiaObject`, which carries version history, so
-  filter it with `WHERE validityEndMjdTai IS NULL` or it multi-counts objects.
-
-**Reading values**
-
-- **`ssp` columns have no descriptions and no units** — 655 of them, all blank.
-  The names are the Butler `sourceTable`/`diaSourceTable` columns, so the Science
-  Pipelines schema is the reference. Table-level descriptions do exist.
-- **NaN became NULL on ingest.** `AVG` skips NULLs and `x > 0` is neither true nor
-  false for them.
-- **Flags are nullable booleans**, so `WHERE isDipole = 0` drops rows where the
-  flag was never set.
-- **`ssObjectId` is `0`, not NULL, for unlinked detections**, so
-  `COUNT(ssObjectId)` counts every row. Use `ssObjectId != 0`; on that basis
-  0.81% of `mppdb.DiaSource` is linked to a solar-system object.
-- **54% of `mpc_orbits` has NULL `a`** — 809,795 of 1,505,545 rows — so any cut on
-  the orbital elements silently drops half the table.
-- **`reliability > 0.9` keeps 1.6%** of `mppdb.DiaSource` (16.3 M of 1.0 B);
-  `> 0.5` keeps 2.6%. Choose a threshold deliberately and report which. It does
-  not remove streaks or edge artifacts — the `pixelFlags_*` columns do that — and
-  `reliabilityVersion` means scores are not comparable across processing runs.
-- **`TOP n` without `ORDER BY`** returns whichever rows the engine reaches first.
-  Fine for eyeballing columns, wrong for anything statistical.
-
-### Speed, and the one trick worth knowing
-
-Each table is sorted on one key. Cone searches prune on `mppdb.*` and `ppdb.*`,
-which are sorted by sky position; id lookups and `BETWEEN` ranges prune on the
-`ssp` tables, which are sorted by id. Everything else scans. Scanning is often
-fine — a `GROUP BY band` over a billion rows is a couple of seconds — but it
-grows with the table, and a cone search on `ssp.source_nv` took **311 s** for
-0.1° across 18 B rows. Run anything like that async.
-
-`WHERE visit = …` on an `ssp` table scans, because the table is organised by id
-and not by visit. Ids are packed per visit, but the packing is undocumented and
-ADQL here has no bitwise operators to unpack it, so ask the database once:
-
-```sql
-SELECT MIN(sourceId) AS lo, MAX(sourceId) AS hi
-FROM ssp.source_nv WHERE visit = 2026051200854
-```
-
-That costs one scan, about 4.5 s. Every subsequent query about that visit then
-uses the range and returns in **0.1 s**, against 5.1 s for the same query written
-as `WHERE visit = …`. Keep the range if you have more than one question.
-
 ### Limits
 
 | limit | value |
@@ -407,8 +332,7 @@ key its queries filter by, so the engine reads a slice rather than scanning.
   storage and load time for queries nobody makes. The consequence is that a cone
   search on `ssp` is a full scan, which is correct but slow.
 
-Measured through the deployed service against `mppdb`, 2026-08-24. These are the
-numbers Part I's guidance rests on:
+Measured through the deployed service against `mppdb`, 2026-08-24:
 
 | query | time |
 |---|---|
