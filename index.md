@@ -50,10 +50,10 @@ wrong. Believe the box over the surrounding text.
 :::
 
 :::{warning}
-Row counts here were measured on 2026-08-24. The `ssp` database grew from 22 to 94
-billion rows in the preceding week. Re-query rather than trusting a number in this
-note: `SELECT COUNT(*) FROM ssp.source_nv` is read from metadata and returns in
-about 0.2 s.
+Row counts here were measured on 2026-08-24. `ssp` grows fast enough that they
+date quickly, so re-query rather than trusting a number in this note:
+`SELECT COUNT(*) FROM ssp.source_nv` is read from metadata and returns in about
+0.2 s.
 :::
 
 ## Part I — Using the service
@@ -235,69 +235,56 @@ when reloaded — see *Operating the service*.
 
 ### The data: provenance and lifecycle
 
-**`mppdb`** was the original science import: DP2 prompt products — a
-**prerelease** of the release now shipped as `dp2` — mapped onto a curated
-registry generated from the vendored Felis `apdb.yaml`. **Retired from this
-service on 2026-08-24**, superseded by `dp2`; the database still exists on the
-backend and in the catalog store, but is no longer in this deployment's
-`[databases]` block and so is not served. The description that follows is how it
-was built, kept because the curation pattern is the one `dp2` should converge on.
-Datatypes, units, Datatypes, units,
-UCDs and descriptions come from Felis; `hpix29`/`cx`/`cy`/`cz` spatial columns,
-principal flags and foreign keys were added. The three large DIA tables came from
-flat DP2 HATS exports via `mppdb ingest --from-hats`, which maps columns onto that
-registry rather than generating a schema. The small tables date to the original
-manual import. `mppdb` also has a Parquet lake and manifest chain on `/data`, left
-from the DuckDB era, which still backs snapshot semantics. Static since 2026-07.
+**`dp2`** is the DP2 data release: thirteen tables, **91.44 B rows** — `Object`,
+`Source`, `DiaSource`, `DiaObject`, `ForcedSource`, `ForcedSourceOnDiaObject`,
+`Visit`, `CcdVisit`, `SSObject`, `SSSource`, `mpc_orbits`, `object_shear_all`,
+`isolated_star_stellar_motions`. Felis-named and `hpix29`-ordered, so cone
+searches prune. It is loaded from flat HATS exports with
+`mppdb ingest --from-hats`, which maps columns onto a curated registry rather
+than generating a schema: datatypes, units, UCDs and descriptions come from
+Felis, while the `hpix29`/`cx`/`cy`/`cz` spatial columns, the principal flags and
+the foreign keys are added by curation. Static.
 
-**`ppdb`** is a static import of the Prompt Products Database: a TAP dump of
-`data-int.lsst.cloud/api/ppdbtap` loaded with `mppdb ingest-tapdump`.
-ClickHouse-only — no lake, no manifests, no GC. Unchanged since 2026-07-25.
+**`ppdb`** is a snapshot of the Prompt Products Database — `DiaObject`,
+`DiaSource`, `DiaForcedSource`, 48.70 M rows — taken 2026-07-25 from a TAP dump
+of `data-int.lsst.cloud/api/ppdbtap` and loaded with `mppdb ingest-tapdump`.
+ClickHouse-only: no Parquet lake, no manifests, no GC. Static.
 
-**`ssp`** is the solar-system working set: one table per export directory, each an
-`acid import butler --split-by visit` export of per-visit parquet parts with
-per-part manifests. Loaded with `mppdb ingest-parquet`, which generates the schema
-from the parquet, computes the spatial columns from `ra`/`dec`, converts NaN to
-NULL, and safe-casts at staging — an `int64`→`int32` overflow fails loudly.
+**`ssp`** is the Solar System Processing working set: eleven tables, **93.77 B
+rows**, one per export directory, each an `acid import butler --split-by visit`
+export of per-visit Parquet parts with per-part manifests. It is loaded with
+`mppdb ingest-parquet`, which generates the schema from the Parquet, computes the
+spatial columns from `ra`/`dec`, converts NaN to NULL, and safe-casts at staging
+so an `int64`→`int32` overflow fails loudly rather than wrapping. Sorted by id,
+with no spatial projection — a deliberate choice, since this working set is
+queried by identifier and by visit rather than by position.
 
-Three products are maintained and grow: `source_daytime`, `source_nv` and
+Three `ssp` products grow: `source_daytime`, `source_nv` and
 `dia_source_prompt`. An append on the export side is followed by
 `ingest-parquet run --append`, which reads the immutable per-part manifests and
-loads only what is new. A provenance ledger in the served database
-(`_ingest_parts`, `_ingest_refs`) maps (visit, detector) to part and holds the
+loads only what is new. A provenance ledger in the served database,
+`_ingest_parts` and `_ingest_refs`, maps (visit, detector) to part and holds the
 invariant `count(live) == sum(_ingest_parts.rows)` per table. The other eight
-products are frozen.
+products are frozen. `ssp`'s ingest configs, loads and catalog content belong to
+the ssp-submit project, not to this service.
 
-**Publishing, for every ingest path:** load into a staging database, verify counts,
-publish with an atomic multi-pair `RENAME TABLE`, then record provenance. Readers
-never see a missing or half-loaded table. (`EXCHANGE TABLES` and
+**Publishing, for every ingest path:** load into a staging database, verify
+counts, publish with an atomic multi-pair `RENAME TABLE`, then record provenance.
+Readers never see a missing or half-loaded table. (`EXCHANGE TABLES` and
 `CREATE OR REPLACE` are unavailable: `renameat2()` is unsupported on the WekaFS
 data path.)
 
-**Cadence:** `dp2` and `ppdb` are static. `ssp` arrives in bursts, whenever a
+**Cadence.** `dp2` and `ppdb` are static. `ssp` arrives in bursts, whenever a
 nightly append actually appends, plus occasional metadata-only catalog publishes.
-Loads run on `sdfiana035` only, because staging goes through the ClickHouse
+Every load runs on `sdfiana035`, because staging goes through the ClickHouse
 server's node-local `user_files` directory.
 
-:::{important}
-**`dp2` shipped on 2026-08-24**: thirteen DP2 release tables, **91.44 B rows**,
-Felis-named and `hpix29`-ordered — `Object`, `Source`, `DiaSource`, `DiaObject`,
-`ForcedSource`, `ForcedSourceOnDiaObject`, `Visit`, `CcdVisit`, `SSObject`,
-`SSSource`, `mpc_orbits`, `object_shear_all`, `isolated_star_stellar_motions`. The
-catalog store now holds four documents at generation 15, and the primary
-deployment serves all four.
-
-**This deployment serves it as of 2026-08-24.** Whether a front-end serves `dp2`
-is its own `[databases]` decision, per the authorization-boundary rule, and the
-order is fixed: `GRANT SELECT ON dp2.* TO mppdb_ro` on the backend first, then a
-`databases.dp2` entry in the chart, then a restart or reload. Skipping the grant
-would leave a service configured for a database it cannot read. When `dp2` takes
-taken over from `mppdb` as this note's reference database, and the timings were
-re-measured against it on 2026-08-24.
-
-`ssp`'s ingest configs, loads and catalog content are owned by the ssp-submit
-project, not by the service.
-:::
+**Adding a database to this service** is two ordered steps and a reload:
+`GRANT SELECT ON <db>.* TO mppdb_ro` on the backend, then a `databases.<db>`
+entry in the chart. The `[databases]` block is the authorization boundary — a
+database absent from it is not served, whatever the store holds — and doing the
+chart half without the grant leaves the service configured for a database it
+cannot read.
 
 ### Ingest and query performance
 
@@ -435,15 +422,15 @@ Full method, ids and reproduction details are in the control directory's
 
 ### The catalog store
 
-Since 2026-08-22 the catalog of record is the `TAP_SCHEMA.registries` table, not
-files. One row per database holds the registry document verbatim as YAML, its
+The catalog of record is the `TAP_SCHEMA.registries` table, not files. One row
+per database holds the registry document verbatim as YAML, its
 sha256, a monotonic `generation`, and publication provenance. The five standard
 TAP_SCHEMA tables are a projection of the store: every publish rederives all five
 from every stored document and swaps them in with one multi-pair rename.
 
-Two results. There is no window where a TAP_SCHEMA table is absent. And an
-incomplete input can no longer delete a schema, because configuration is not an
-input to the derivation — the store is.
+Two properties follow. There is never a window in which a TAP_SCHEMA table is
+absent. And an incomplete configuration cannot delete a schema, because
+configuration is not an input to the derivation — the store is.
 
 The store keeps the YAML, not just the five tables, because TAP_SCHEMA is a lossy
 projection. The registry's `physical` block — the spatial binding and HEALPix depth
@@ -461,6 +448,14 @@ own catalog, data first and catalog second: a crash between the two leaves a loa
 but unadvertised table, which republishing fixes, whereas the reverse order would
 advertise a table that does not exist. The upsert is column-grain, so curated
 `description`, `unit` and `ucd` values survive a re-ingest.
+
+:::{warning}
+**`principal` does not survive a re-ingest.** The column-grain merge does not
+preserve it, and ingest does not set it, so re-ingesting a table drops its
+principal flags — which is what SCS uses to find a row identifier and to define
+VERB=2. The flags then need re-applying by hand as part of the rebuild.
+Tracked as [mppdb#186](https://github.com/mjuric/mppdb/issues/186).
+:::
 
 **How the service consumes it.** The service loads its catalog only from the store,
 at startup, and refuses to boot on a missing or sha-mismatched document rather than
@@ -546,11 +541,9 @@ node, `mppdb catalog show` reports the same with provenance.
 across the whole store, so publishing *any* schema advances it for everyone. A
 service can be several generations behind while serving byte-identical content,
 because the publishes that moved the counter touched schemas it does not serve.
-This is not hypothetical. Before `dp2` was served, this deployment sat at
-generation 2 against a store at 15 with all three of its digests matching the
-store's current documents exactly: the thirteen intervening generations were
-`dp2`'s per-table ingest publishes, none of which touched a schema it served.
-Reloading would have changed nothing. Adding `dp2` is what moved it to 15.
+A gap of a dozen generations is unremarkable: a single database's ingest
+publishes one table at a time, advancing the counter once per table without
+touching any other schema's document.
 
 The practical rule: a digest mismatch on a served schema means reload now; a
 generation gap with matching digests means a reload would change nothing, and
@@ -648,7 +641,7 @@ The service refuses to start, complaining about the catalog
   sha-mismatched document aborts startup. Publish the catalog, then start.
 
 Async queries fail in the browser with a network error
-: The job URL was minted as `http://` while the page is `https://`, and the browser
+: The job URL is minted as `http://` while the page is `https://`, and the browser
   blocks the cross-scheme request. Behind a TLS-terminating proxy the service must
   pin its advertised base URL rather than derive it from the request.
 
