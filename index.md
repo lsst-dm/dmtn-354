@@ -108,16 +108,29 @@ Name the columns you want.
 
 ### Limits
 
-| limit | value |
-|---|---|
-| rows returned, default / maximum | **50,000** / 2,000,000 |
-| query timeout, `/sync` / async | **60 s** / 3600 s |
-| results kept | 7 days |
+Sync and async are governed by different limits, and the gap is four orders of
+magnitude — so which one you are using matters more than any individual number.
+**The console always runs async.**
+
+| limit | `/sync` (and pyvo `search()`) | async (console, pyvo `run_async()`) |
+|---|---|---|
+| rows returned, default | **50,000** | **1,000,000,000** |
+| rows returned, maximum | 2,000,000 | 1,000,000,000 |
+| query timeout | **60 s** | 3600 s |
+| results kept | — | 7 days |
+
+That is why a console cell can return hundreds of millions of rows without
+complaint: the demo notebook's all-sky cell counts every one of `dp2.DiaObject`'s
+232 million rows and is nowhere near the async ceiling. Nothing about a
+particular account changes this — the `standard` and `heavy` tiers have the same
+billion-row async limit, and differ in concurrency, memory and rate instead.
 
 :::{warning}
-**Truncation at 50,000 rows is reported as success**, not as an error — the
-response carries an `OVERFLOW` status. If a result is exactly 50,000 rows, check
-for it before believing that is the whole answer.
+**On `/sync`, truncation at 50,000 rows is reported as success**, not as an
+error — the response carries an `OVERFLOW` status. If a sync result is exactly
+50,000 rows, check for it before believing that is the whole answer. Note that
+`/capabilities` advertises only these sync figures, so a VO client may show you
+50,000 / 2,000,000 and give no hint that async is a billion.
 :::
 
 Not supported, and the failures are cryptic enough to be worth listing:
@@ -419,8 +432,9 @@ fans out across all detectors and exceeds the sync limit, where the same join on
 slow" report is often a join-key problem. The 0.1–0.7 s cones are genuine, and
 they are what the `hpix29` sort key buys: the same shape of query against `ssp`,
 which has no spatial ordering, is the 190 s row. And the photometry cone returned
-exactly 50,000 rows — the default `MAXREC` — so that row is a live instance of
-the `OVERFLOW` truncation the service reports as success.
+exactly 50,000 rows — the sync default `MAXREC` — so that row is a live instance
+of the `OVERFLOW` truncation the service reports as success. The harness runs on
+`/sync`; the same query from the console would have returned the lot.
 
 Full method, ids and reproduction details are in the control directory's
 `notes/2026-08-24-mppdb-tap-measurements.md`.
