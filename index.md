@@ -34,9 +34,9 @@ note: `SELECT COUNT(*) FROM ssp.source_nv` is read from metadata and returns in
 about 0.2 s.
 :::
 
-# Part I — Using the service
+## Part I — Using the service
 
-## What mppdb holds, and why it exists
+### What mppdb holds, and why it exists
 
 There are more Rubin catalog datasets than there are places to run SQL against
 them. They live in Butler collections and file exports. That works for pipelines;
@@ -75,7 +75,7 @@ columns differ slightly. Timings in this note were measured against `mppdb` and
 should be re-measured once `dp2` is queryable.
 :::
 
-## Getting started
+### Getting started
 
 Open <https://usdf-rsp-dev.slac.stanford.edu/mppdb/ui/>. Rubin SSO logs you in and
 your account is created on first visit. Anyone who can log in to `usdf-rsp-dev`
@@ -123,9 +123,9 @@ A token minted here is a Rubin RSP token scoped to `read:tap`; the service does
 not issue its own. Your preferences, quotas and job history, however, live in this
 service and are not shared with the rest of the RSP.
 
-## Finding your way around the tables
+### Finding your way around the tables
 
-### `ssp` — eleven tables, one per processing run
+#### `ssp` — eleven tables, one per processing run
 
 Which table you want depends on which processing run you care about. The row
 counts do not tell you that, and picking the biggest is a trap.
@@ -185,7 +185,7 @@ authoritative count of DP2 sources.
 Every table's full description — naming the collection and run it came from — is
 in the schema browser and in `TAP_SCHEMA.tables`.
 
-### `mppdb` — twelve tables, four of them empty
+#### `mppdb` — twelve tables, four of them empty
 
 | table | rows | |
 |---|---|---|
@@ -230,7 +230,7 @@ table — 52 columns including `seeing` (arcsec), `skyBg` (adu), `zeroPoint`,
 `psfSigma`, `astromOffsetMean`, `nPsfStar`. It is what you join against when
 asking whether a detection anomaly tracks the observing conditions.
 
-### Column meanings
+#### Column meanings
 
 `mppdb` and `ppdb` columns carry units, UCDs and descriptions from Felis, visible
 in the schema browser and in `TAP_SCHEMA.columns`:
@@ -257,13 +257,13 @@ Two things about values, both of which change what a comparison means:
   flag satisfies neither, so `WHERE isDipole = 0` silently drops rows where the
   flag was never set.
 
-## Writing queries
+### Writing queries
 
 **Qualify table names**: `mppdb.DiaSource`, `ssp.source_nv`, `ppdb.DiaObject`.
 Unqualified names resolve to **`mppdb`** — `FROM DiaObjectLast` works,
 `FROM source_nv` does not.
 
-### What is fast
+#### What is fast
 
 Each table is physically sorted on one key. A query is fast when its filter
 matches that key, because the engine reads a slice instead of scanning. In terms
@@ -312,7 +312,7 @@ range if you are going to ask more than one question about a visit.
 You never write `hpix29` yourself. It is the spatial sort key, it is hidden from
 the schema browser deliberately, and `CONTAINS(...)` is what puts it to work.
 
-### Limits you will hit
+#### Limits you will hit
 
 | limit | value |
 |---|---|
@@ -357,7 +357,7 @@ numeric functions `ABS CEILING DEGREES EXP FLOOR LOG LOG10 MOD PI POWER RADIANS
 RAND ROUND SQRT TRUNCATE ACOS ASIN ATAN ATAN2 COS COT SIN TAN`. `CAST` is
 restricted to scalar types.
 
-### Examples
+#### Examples
 
 All timings below were measured on this service against `mppdb`.
 
@@ -477,7 +477,7 @@ before drawing a conclusion about population sizes.
 
 The console ships several of these ready to run.
 
-## Getting results out
+### Getting results out
 
 Results come back as **VOTable, CSV or Parquet** — pass `FORMAT=votable`, `csv` or
 `parquet` on `/sync`, or when fetching an async job's result. Those three are all
@@ -508,7 +508,7 @@ and cones on `DiaSource` are **disabled** on this deployment because the table i
 too large to cone through. For anything SCS will not do, use ADQL with
 `CONTAINS`.
 
-## TOPCAT and pyvo
+### TOPCAT and pyvo
 
 The TAP endpoint is `https://usdf-rsp-dev.slac.stanford.edu/mppdb`.
 
@@ -536,7 +536,7 @@ job = service.run_async("SELECT TOP 10 * FROM ssp.dia_source_dp1")
 print(job.to_table())
 ```
 
-## Things to know
+### Things to know
 
 **This is a pilot on one node.** If the host reboots, ClickHouse does not come
 back on its own and every query fails until someone restarts it by hand. There is
@@ -553,9 +553,9 @@ over TAP yet.
 Async jobs are per-user, with quotas on concurrency and spool space. The console
 lists yours.
 
-# Part II — Operations and internals
+## Part II — Operations and internals
 
-## Architecture
+### Architecture
 
 Two parts:
 
@@ -596,7 +596,7 @@ The unit of operation between the two parts is the catalog: a publish on the
 backend changes what the service should serve, and the service picks it up only
 when reloaded — see *Operating the service*.
 
-## The data: provenance and lifecycle
+### The data: provenance and lifecycle
 
 **`mppdb`** is the original science import: DP2 prompt products — a **prerelease**
 of the release now loading as `dp2` — mapped onto a curated registry generated
@@ -648,7 +648,7 @@ against it. `ssp`'s ingest configs, loads and catalog content are owned by the
 ssp-submit project, not by the service.
 :::
 
-## Ingest and query performance
+### Ingest and query performance
 
 Two things had to be true: datasets of this size must load in hours and be
 extendable incrementally, and queries must return quickly. Both hold.
@@ -708,7 +708,7 @@ all thirteen products succeeded first time. Per-catalog `acid-import-log.yaml`
 files under the DP2 export directory record each run's arguments, worker counts,
 totals and elapsed time.
 
-## The catalog store
+### The catalog store
 
 Since 2026-08-22 the catalog of record is the `TAP_SCHEMA.registries` table, not
 files. One row per database holds the registry document verbatim as YAML, its
@@ -746,9 +746,9 @@ Startup is deliberately the opposite, because there is nothing good to keep
 serving. `GET /catalog` reports the served generation and per-schema digests, which
 is what makes publishing and reloading checkable instead of assumed.
 
-## The deployments
+### The deployments
 
-### The backend node
+#### The backend node
 
 Everything that writes lives on `sdfiana035`, inside an apptainer sandbox whose
 root filesystem is a writable directory on WekaFS. It is here rather than in
@@ -767,7 +767,7 @@ venv. `git pull` updates it. Configuration lives in `deploy/usdf/mppdb.toml` —
 databases are in play — plus committed scalars in `mppdb.env` and two git-ignored
 mode-600 secret files.
 
-### The Phalanx application
+#### The Phalanx application
 
 Reads the backend, owns no data. Defined in `applications/mppdb/`, currently image
 `ghcr.io/mjuric/mppdb:sha-35bd883`.
@@ -788,9 +788,9 @@ The chart has a `useVaultSecret` flag; turning it on produces a `VaultSecret` of
 same name, so the swap changes nothing else.
 :::
 
-## Operating the service
+### Operating the service
 
-### Is the service serving the current catalog?
+#### Is the service serving the current catalog?
 
 The service loads its catalog at startup and holds it until reloaded, so this is a
 real question with a cheap answer. Compare what the store holds with what the
@@ -819,7 +819,7 @@ generation ahead of the served one means a publish happened and the service has 
 reloaded. On the backend node, `mppdb catalog show` reports the same with
 provenance.
 
-### After a catalog change
+#### After a catalog change
 
 On the backend node:
 
@@ -848,7 +848,7 @@ whose queries now fail, while its catalog still looks healthy. Additions only hi
 a new table.
 :::
 
-### Checking data and the service
+#### Checking data and the service
 
 After a load, check that served rows equal the export's declared rows exactly, and
 that the ledger reconciles — `sum(_ingest_parts.rows)` equals the live count, per
@@ -867,7 +867,7 @@ The console's schema browser uses this, which is why the read-only user needs
 `SELECT` on `system.parts`. Without it the browser silently shows column counts
 instead of row counts.
 
-## Maintaining and upgrading
+### Maintaining and upgrading
 
 **Backend tooling** updates with `git pull`. There is no service to restart there,
 only the ClickHouse daemon, which is left alone.
@@ -889,7 +889,7 @@ upstream release and teaches operators to ignore it; against an immutable URL, a
 mismatch means something real. When a pin must be bumped, two independent fetches
 agreeing is the minimum evidence, and the reasoning belongs in a comment.
 
-## Troubleshooting
+### Troubleshooting
 
 Symptoms that have happened, with causes.
 
@@ -933,7 +933,7 @@ HTTP 403 fetching a file that is listed
 An `--append` refuses
 : The ledger cannot account for the table. Do not force it; re-import wholesale.
 
-## Known gaps
+### Known gaps
 
 Ordered by how much they should worry a new owner.
 
@@ -971,7 +971,7 @@ Ordered by how much they should worry a new owner.
 9. **Single-operator knowledge.** The mppdb repository's runbooks are good, but
    this note is the first document an outside operator could start from.
 
-## What production would require
+### What production would require
 
 A handover checklist, not a plan of record.
 
