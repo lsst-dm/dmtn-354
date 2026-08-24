@@ -119,12 +119,6 @@ magnitude — so which one you are using matters more than any individual number
 | query timeout | **60 s** | 3600 s |
 | results kept | — | 7 days |
 
-That is why a console cell can return hundreds of millions of rows without
-complaint: the demo notebook's all-sky cell counts every one of `dp2.DiaObject`'s
-232 million rows and is nowhere near the async ceiling. Nothing about a
-particular account changes this — the `standard` and `heavy` tiers have the same
-billion-row async limit, and differ in concurrency, memory and rate instead.
-
 :::{warning}
 **On `/sync`, truncation at 50,000 rows is reported as success**, not as an
 error — the response carries an `OVERFLOW` status. If a sync result is exactly
