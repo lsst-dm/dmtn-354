@@ -166,8 +166,8 @@ Two parts:
 
 - a **backend** on `sdfiana035`: the ClickHouse server, the ingest tooling, and
   the catalog store. All writes happen here.
-- the **service**: the `mppdb` Phalanx application on `usdf-rsp-dev`. It reads the
-  backend and owns no data.
+- the **service**: the `mppdb` Phalanx application on `usdf-rsp-dev`. It provides
+  the TAP API and the web UI. It reads the backend and owns no data.
 
 ```{mermaid}
 flowchart TB
@@ -422,8 +422,8 @@ mode-600 secret files.
 
 #### The Phalanx application
 
-Reads the backend, owns no data. Defined in `applications/mppdb/`, currently image
-`ghcr.io/mjuric/mppdb:sha-35bd883`.
+Provides the TAP API and the web UI. Reads the backend, owns no data. Defined in
+`applications/mppdb/`, currently image `ghcr.io/mjuric/mppdb:sha-35bd883`.
 
 | aspect | how |
 |---|---|
