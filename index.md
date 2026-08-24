@@ -5,7 +5,7 @@ River is a SQL analytics database for Rubin catalog data, with a TAP 1.1 service
 providing an ADQL/TAP API and a web UI over it. It holds **185 billion rows**
 across three databases on one ClickHouse server at the USDF — the DP2 data
 release, the Solar System Processing working set, and a Prompt Products snapshot
-— and you query it from TOPCAT, pyvo, or its own web console. River is the
+— and you query it from TOPCAT, pyvo, or its own web UI. River is the
 deployment; `mppdb` is the software it runs, which is why that name persists
 throughout its configuration and tooling.
 
@@ -64,22 +64,24 @@ Open <https://usdf-rsp-dev.slac.stanford.edu/river/ui/>. Rubin SSO logs you in a
 your account is created on first visit. Anyone who can log in to `usdf-rsp-dev`
 can query.
 
-Then use the console, which is built to be explored rather than documented:
+Then use the web UI, which is built to be explored rather than documented:
 
 - The **demo notebook** in your account, *Demo: Sky/Visit/Light Curve*, is the
   intended way in. Sixteen cells go from the whole sky down to one object's light
-  curve. Notebooks here speak ADQL, not Python; cells run in order, can be named,
-  and later cells can reference an earlier cell's result with `{{ }}`.
+  curve. These are **ADQL notebooks**, not Jupyter: a cell holds a query, not
+  Python. Cells run in order, can be named, and later cells can reference an
+  earlier cell's result with `{{ }}`.
 - The **schema browser** in the sidebar lists every database, table and column
   with units and descriptions. That is the reference for what a column means, so
   this note does not restate it.
-- **Worked example queries ship in the console.** Start from those rather than
-  from anything written here.
+- **Worked example queries ship with it.** Start from those rather than from
+  anything written here.
 
-Two things about the console that are not visible from it: it runs **every query
-asynchronously**, so console queries get the 3600 s limit rather than the 60 s
-one; and the demo notebook is `dp2`-qualified, but you only get that version if
-your notebook list is empty when you first look. An account created before
+Two things about the ADQL notebooks that are not visible from them: they run
+**every query asynchronously**, so a notebook query gets the 3600 s limit rather
+than the 60 s one; and the demo notebook is `dp2`-qualified, but you only get that
+version if your notebook list is empty when you first look. An account created
+before
 2026-08-24 still holds the old one, whose unqualified queries no longer resolve —
 delete it and reload to be re-seeded.
 
@@ -110,9 +112,9 @@ Name the columns you want.
 
 Sync and async are governed by different limits, and the gap is four orders of
 magnitude — so which one you are using matters more than any individual number.
-**The console always runs async.**
+**ADQL notebooks always run async.**
 
-| limit | `/sync` (and pyvo `search()`) | async (console, pyvo `run_async()`) |
+| limit | `/sync` (and pyvo `search()`) | async (ADQL notebooks, pyvo `run_async()`) |
 |---|---|---|
 | rows returned, default | **50,000** | **1,000,000,000** |
 | rows returned, maximum | 2,000,000 | 1,000,000,000 |
@@ -209,7 +211,7 @@ flowchart TB
     ING --> CH
   end
   SVC["river Phalanx app · usdf-rsp-dev<br/>/river"]
-  U["users: console · TOPCAT · pyvo"]
+  U["users: web UI · TOPCAT · pyvo"]
   CH -- "read-only, mppdb_ro" --> SVC
   SVC --> U
 ```
@@ -415,7 +417,7 @@ they are what the `hpix29` sort key buys: the same shape of query against `ssp`,
 which has no spatial ordering, is the 190 s row. And the photometry cone returned
 exactly 50,000 rows — the sync default `MAXREC` — so that row is a live instance
 of the `OVERFLOW` truncation the service reports as success. The harness runs on
-`/sync`; the same query from the console would have returned the lot.
+`/sync`; the same query from an ADQL notebook would have returned the lot.
 
 Full method, ids and reproduction details are in the control directory's
 `notes/2026-08-24-mppdb-tap-measurements.md`.
@@ -593,7 +595,7 @@ SELECT database, formatReadableQuantity(sum(rows)),
 FROM system.parts WHERE active GROUP BY database
 ```
 
-The console's schema browser uses this, which is why the read-only user needs
+The web UI's schema browser uses this, which is why the read-only user needs
 `SELECT` on `system.parts`. Without it the browser silently shows column counts
 instead of row counts.
 
@@ -644,11 +646,11 @@ Async queries fail in the browser with a network error
   blocks the cross-scheme request. Behind a TLS-terminating proxy the service must
   pin its advertised base URL rather than derive it from the request.
 
-The console loads but its assets 404
+The web UI loads but its assets 404
 : The service is hosted under a URL prefix it does not know about. It needs its
   public base URL so generated paths carry the prefix.
 
-Newly added console files return 401 until a restart
+Newly added web UI files return 401 until a restart
 : The anonymous-asset allowlist is read at startup. Restart in the same step as any
   deploy that adds served files.
 
