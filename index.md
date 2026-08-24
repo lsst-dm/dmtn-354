@@ -2,14 +2,16 @@
 
 ```{abstract}
 mppdb is a SQL analytics database for Rubin catalog data, with a TAP 1.1 service
-providing an ADQL/TAP API and a web UI over it. It holds **120 billion rows**
-across **four** databases on one ClickHouse server at the USDF, and you query it
-from TOPCAT, pyvo, or its own web console.
+providing an ADQL/TAP API and a web UI over it. It holds **185 billion rows**
+across three databases on one ClickHouse server at the USDF — the DP2 data
+release, the Solar System Processing working set, and a Prompt Products snapshot
+— and you query it from TOPCAT, pyvo, or its own web console.
 
-It is fast enough to use interactively at that scale. Indexed lookups return in
-**a fraction of a second**, aggregates over a billion rows in **2–12 seconds**,
-and the slowest case measured — an unindexed cone search across **18 billion
-rows** — in **five minutes**. Ingest is on the same footing: a release-scale
+It is fast enough to use interactively at that scale. Indexed lookups and
+sky-position cone searches return in **under a second**, aggregates over a
+billion rows in **a few seconds**, and the slowest case measured — an
+*unindexed* cone search across **18 billion rows**, where nothing prunes — in
+**three to five minutes**. Ingest is on the same footing: a release-scale
 dataset goes from a Butler repository to a queryable table in **hours**, at about
 **200 million rows per minute** into ClickHouse, and nightly appends extend it
 **incrementally, in minutes**.
@@ -71,40 +73,47 @@ Then use the console, which is built to be explored rather than documented:
 
 Two things about the console that are not visible from it: it runs **every query
 asynchronously**, so console queries get the 3600 s limit rather than the 60 s
-one; and the demo notebook still queries `mppdb` rather than `dp2`, which is a
-pending change, at which point `DiaObjectLast` goes away and `DiaObject` takes its
-place.
+one; and the demo notebook is `dp2`-qualified, but you only get that version if
+your notebook list is empty when you first look. An account created before
+2026-08-24 still holds the old one, whose unqualified queries no longer resolve —
+delete it and reload to be re-seeded.
 
 ### What is in it
 
 | database | what it holds | rows |
 |---|---|---|
-| `mppdb` | DP2 **prerelease** prompt products: DIA sources and objects, solar-system objects, MPC orbits | 25.74 B |
 | `ssp` | per-visit source catalogs for Solar System Processing — eleven tables, one per processing run | 93.77 B |
-| `dp2` | the DP2 data release: thirteen tables, among them `Object`, `Source`, `ForcedSource` | 91.44 B |
+| `dp2` | the DP2 data release: thirteen tables, among them `Object`, `Source`, `DiaSource`, `ForcedSource` | 91.44 B |
 | `ppdb` | a static snapshot of the Prompt Products Database | 48.70 M |
 
-`dp2` was added on 2026-08-24 and is the newest. Unlike `ssp` it is **sorted by
-sky position**, so cone and region searches are its indexed access path, where in
-`ssp` ids are indexed and cone searches are full scans.
+**Every table reference must be qualified** — `dp2.DiaSource`, `ssp.source_nv`.
+There is no default database, so a bare `FROM DiaSource` is rejected with
+`table 'DiaSource' must be schema-qualified`. That is deliberate: no one of these
+is the natural home for an unqualified name.
+
+`dp2` and `ssp` are organised differently, and it decides which of your queries
+are fast. `dp2` is **sorted by sky position**, so cone and region searches are its
+indexed access path. `ssp` is **sorted by id**, so id lookups and ranges are
+indexed there and a cone search is a full scan — correct, but minutes rather than
+milliseconds.
 
 Two things in `dp2` will surprise you if you `SELECT *`: `Object` has **1,225
 columns**, and `mpc_orbits` carries a JSON blob of roughly **5.7 KB per row**.
 Name the columns you want.
 
-Qualify table names: `mppdb.DiaSource`, `ssp.source_nv`. Unqualified names
-resolve to `mppdb`, so `FROM DiaObjectLast` works and `FROM source_nv` does not.
-
 :::{important}
-**"DP2" means three different things here.** `mppdb` is a *prerelease* DP2 import
-and is what most of this note's measurements used. `dp2` is the *final* release,
-served here since 2026-08-24. `ssp.source_dp2` and `ssp.dia_source_dp2` are
-per-visit source tables extracted from DP2.
+**"DP2" names two different things here.** The `dp2` database is the DP2 data
+release itself — thirteen products, ~91.4 B rows, the largest being
+`ForcedSource`, `ForcedSourceOnDiaObject` and `Source`. Separately,
+`ssp.source_dp2` and `ssp.dia_source_dp2` are per-visit *source tables extracted
+from* DP2 for Solar System Processing, with different columns and a different
+sort key. Same release, different shape, different purpose.
 
-`dp2` is not simply a bigger `mppdb`: it is thirteen data-release products
-(~91.4 B rows) whose three largest — `ForcedSource`, `ForcedSourceOnDiaObject`,
-`Source` — have no counterpart in `mppdb` at all. Where the two overlap, on the
-DIA prompt products, row counts are comparable and columns differ slightly.
+A third sense existed until 2026-08-24: a database called `mppdb`, a DP2
+prerelease that everything queried while `dp2` was loading. It has been retired.
+If you find a query or notebook referring to `mppdb.*`, it is from before the
+cutover and needs requalifying to `dp2.*` — the prompt-product tables correspond,
+except that `DiaObjectLast` is gone and `DiaObject` takes its role.
 :::
 
 ### Limits
@@ -162,10 +171,14 @@ print(job.to_table())
 
 Results come back as **VOTable, CSV or Parquet**; `fits`, `tsv` and `json` are
 rejected, and `/capabilities` advertises only the VOTable serialisations, so a
-strict VO client may not offer you the other two. There is a Simple Cone Search
-endpoint at `/scs?RA=&DEC=&SR=`, defaulting to `DiaObjectLast`; its table name is
-unqualified and `mppdb`-only, `SR` is capped at 5°, and `DiaSource` cones are
-disabled.
+strict VO client may not offer you the other two.
+
+There is also a **Simple Cone Search** endpoint at `/scs?RA=&DEC=&SR=`, which
+resolves against `dp2` and defaults to `dp2.DiaObject`. Its table name is given
+**unqualified** — `/scs/DiaObject`, not `/scs/dp2.DiaObject`, which fails with
+`unknown SCS table`. `SR` is capped at **5°**, and cones on `DiaSource` are
+disabled because the table is too large to cone through. For anything SCS will
+not do, use ADQL with `CONTAINS`.
 
 ### Things to know
 
@@ -195,7 +208,7 @@ Two parts:
 flowchart TB
   subgraph BACKEND["backend · sdfiana035 · apptainer sandbox"]
     ING["ingest: parquet / HATS / tapdump<br/>publishes data, then catalog"]
-    CH[("ClickHouse 26.6<br/>dp2 · mppdb · ppdb · ssp<br/>TAP_SCHEMA + registries")]
+    CH[("ClickHouse 26.6<br/>dp2 · ppdb · ssp<br/>TAP_SCHEMA + registries")]
     ING --> CH
   end
   SVC["mppdb Phalanx app · usdf-rsp-dev<br/>/mppdb"]
@@ -225,9 +238,14 @@ when reloaded — see *Operating the service*.
 
 ### The data: provenance and lifecycle
 
-**`mppdb`** is the original science import: DP2 prompt products — a **prerelease**
-of the release now shipped as `dp2` — mapped onto a curated registry generated
-from the vendored Felis `apdb.yaml`. Datatypes, units,
+**`mppdb`** was the original science import: DP2 prompt products — a
+**prerelease** of the release now shipped as `dp2` — mapped onto a curated
+registry generated from the vendored Felis `apdb.yaml`. **Retired from this
+service on 2026-08-24**, superseded by `dp2`; the database still exists on the
+backend and in the catalog store, but is no longer in this deployment's
+`[databases]` block and so is not served. The description that follows is how it
+was built, kept because the curation pattern is the one `dp2` should converge on.
+Datatypes, units, Datatypes, units,
 UCDs and descriptions come from Felis; `hpix29`/`cx`/`cy`/`cz` spatial columns,
 principal flags and foreign keys were added. The three large DIA tables came from
 flat DP2 HATS exports via `mppdb ingest --from-hats`, which maps columns onto that
@@ -259,7 +277,7 @@ never see a missing or half-loaded table. (`EXCHANGE TABLES` and
 `CREATE OR REPLACE` are unavailable: `renameat2()` is unsupported on the WekaFS
 data path.)
 
-**Cadence:** `mppdb` and `ppdb` are static. `ssp` arrives in bursts, whenever a
+**Cadence:** `dp2` and `ppdb` are static. `ssp` arrives in bursts, whenever a
 nightly append actually appends, plus occasional metadata-only catalog publishes.
 Loads run on `sdfiana035` only, because staging goes through the ClickHouse
 server's node-local `user_files` directory.
@@ -277,8 +295,8 @@ is its own `[databases]` decision, per the authorization-boundary rule, and the
 order is fixed: `GRANT SELECT ON dp2.* TO mppdb_ro` on the backend first, then a
 `databases.dp2` entry in the chart, then a restart or reload. Skipping the grant
 would leave a service configured for a database it cannot read. When `dp2` takes
-over from `mppdb` as the note's reference database, the timings here should be
-re-measured against it — that has not been done yet.
+taken over from `mppdb` as this note's reference database, and the timings were
+re-measured against it on 2026-08-24.
 
 `ssp`'s ingest configs, loads and catalog content are owned by the ssp-submit
 project, not by the service.
@@ -363,31 +381,56 @@ key its queries filter by, so the engine reads a slice rather than scanning.
   storage and load time for queries nobody makes. The consequence is that a cone
   search on `ssp` is a full scan, which is correct but slow.
 
-Measured through the deployed service against `mppdb`, 2026-08-24:
+Measured through the deployed service against `dp2`, 2026-08-24, at catalog
+generation 20. Each query was run twice; both timings are given, because the gap
+between them is the point.
 
-| query | time |
-|---|---|
-| `COUNT(*)` on `ssp.source_nv` (18 B rows) | 0.2 s — metadata, not a scan |
-| id-range query on `ssp.source_nv`, one visit, `detect_isPrimary` cut | **0.1 s** |
-| `MIN`/`MAX` `sourceId` for one visit (the range lookup) | 4.5 s |
-| `WHERE visit = …` count on `ssp.source_nv` | 5.1 s |
-| **cone search on `ssp.source_nv`, 0.1°** | **311 s**, 46,616 matched — async only |
-| cone on `mppdb.DiaObjectLast`, 0.5°, `TOP 1000` no `ORDER BY` | 0.2 s — first 1000 only |
-| cone on `mppdb.DiaObject` + photometry, validity-filtered, 0.5° | 20.0 s, 23,536 rows |
-| `GROUP BY band` with `COUNT`/`MIN`/`MAX` on `DiaSource` | 2.2 s |
-| `GROUP BY band` with `AVG(snr)`, no cuts | 11.9 s |
-| the same with `reliability > 0.9 AND isDipole = 0` | 10.4 s |
-| nightly linkage, `WHERE ssObjectId != 0`, grouped | 7.5 s, 365 rows |
-| `SSSource` × `DiaSource` residuals, one designation | 4.6 s, 732 rows |
-| `DiaSource` × `DetectorVisitProcessingSummary`, `visit` **and** `detector` | **2.8 s**, 704 rows |
-| the same join on `visit` alone | exceeds the 60 s sync limit |
+| query | first | repeat | rows |
+|---|---|---|---|
+| `COUNT(*)` on `ssp.source_nv` (18 B rows) | 0.1 s | 0.1 s | metadata, not a scan |
+| id-range query on `ssp.source_nv`, one visit, `detect_isPrimary` | 0.1 s | 0.1 s | 705,581 |
+| `MIN`/`MAX` `sourceId` for one visit | 0.1 s | 0.1 s | the range lookup |
+| `WHERE visit = …` count on `ssp.source_nv` | 0.1 s | 0.1 s | 791,503 |
+| cone on `dp2.DiaObject`, 0.5°, `TOP 1000` no `ORDER BY` | 0.7 s | 0.1 s | 1,000 |
+| cone on `dp2.DiaObject` + per-band photometry, 0.5° | 0.2 s | 0.2 s | 50,000 — **truncated** |
+| `GROUP BY band` with `COUNT`/`MIN`/`MAX` on `dp2.DiaSource` | 0.9 s | 0.9 s | 6 |
+| `GROUP BY band` with `AVG(snr)`, no cuts | 5.0 s | 0.9 s | 6 |
+| the same with `reliability > 0.9 AND isDipole = 0` | 2.1 s | 1.2 s | 6 |
+| nightly linkage, `WHERE ssObjectId != 0`, grouped | 0.9 s | 0.9 s | 365 |
+| `SSSource` × `DiaSource` residuals, one designation | 0.8 s | 0.7 s | 732 |
+| `DiaSource` × `CcdVisit`, joined on `visit` **and** `detector` | 2.6 s | 2.6 s | 704 |
+| **cone on `ssp.source_nv`, 0.1°, fresh sky position** | **190.6 s** | — | 20,691 — async only |
 
-Two things in that table are worth an operator's attention. A join on `visit`
-alone fans out across all detectors and times out where the same join on
-`visit` and `detector` returns in under three seconds — so a user report of "the
-service is slow" is often a join-key problem. And the 0.2 s cone is time to the
-first 1000 rows under an unordered `TOP`, not the cost of the whole cone;
-quoting it as cone-search performance overstates the service.
+:::{warning}
+**These numbers are page-cache sensitive, and only the last row is reliably
+cold.** ClickHouse's query cache is disabled here (`use_query_cache = 0`), so
+repetition is not memoisation — it is the operating system holding the byte
+ranges a previous query read. The effect is not subtle. The same `ssp` cone
+measured **311 s** the first time and **0.1 s** on every re-run at the same
+centre, then went straight back over the 60 s sync ceiling at a centre nobody had
+touched.
+
+So a benchmark that reuses one sky position measures the cache and reports a
+service roughly 600x faster than a user experiences. `notes/bench-tap.sh` in the
+control directory randomises the cone centre for exactly this reason, which is
+why the last row is trustworthy: 190.6 s at one fresh position, 311 s at another,
+the difference being how many rows each region holds. **A first-touch `ssp` cone
+costs three to five minutes.**
+
+The whole-table aggregates are warm even in the "first" column, having been run
+repeatedly across a day, so read them as a floor rather than a characteristic
+cost. A truly cold measurement needs the page cache dropped on the ClickHouse
+host, which is not ours to do.
+:::
+
+Three things there are worth an operator's attention. A join on `visit` alone
+fans out across all detectors and exceeds the sync limit, where the same join on
+`visit` **and** `detector` returns in under three seconds — so a "the service is
+slow" report is often a join-key problem. The 0.1–0.7 s cones are genuine, and
+they are what the `hpix29` sort key buys: the same shape of query against `ssp`,
+which has no spatial ordering, is the 190 s row. And the photometry cone returned
+exactly 50,000 rows — the default `MAXREC` — so that row is a live instance of
+the `OVERFLOW` truncation the service reports as success.
 
 Full method, ids and reproduction details are in the control directory's
 `notes/2026-08-24-mppdb-tap-measurements.md`.
@@ -460,7 +503,7 @@ Provides the TAP API and the web UI. Reads the backend, owns no data. Defined in
 |---|---|
 | auth | `GafaelfawrIngress`, scope `read:tap`; the service trusts the username header the ingress injects and creates the account on first sight |
 | path | `/mppdb`, prefix stripped before the pod; the app adds it back when generating URLs |
-| database credential | `mppdb_ro`: SELECT on `dp2`, `mppdb`, `ppdb`, `ssp`, `TAP_SCHEMA`, `system.parts` |
+| database credential | `mppdb_ro`: SELECT on `dp2`, `mppdb`, `ppdb`, `ssp`, `TAP_SCHEMA`, `system.parts`. The `mppdb` grant is now unused — the database is not served — and can be revoked whenever convenient |
 | state | 20 GiB `wekafs` ReadWriteOnce volume at `/data` |
 | replicas | exactly one, `strategy: Recreate` — the state engine is single-writer and two writers corrupt `state.db` |
 | secrets | hand-created: `mppdb` (database credential) and `mppdb-pull` (registry token) |
