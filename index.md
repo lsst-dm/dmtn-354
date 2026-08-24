@@ -18,9 +18,9 @@ It is a pilot. It runs on one node, has no replication and no backups, and does
 not come back on its own after a host reboot. It is in real use anyway. This note
 describes what is deployed, not what is planned.
 
-**Part I — Using the service** (§2–§7) covers what is in the database and how to
-query it. **Part II — Operations and internals** (§8–§17) covers how it is built,
-how to run it, and what would have to change for production.
+**Part I — Using the service** covers what is in the database and how to query
+it. **Part II — Operations and internals** covers how it is built, how to run it,
+and what would have to change for production.
 
 :::{important}
 **Current status** boxes like this one flag something provisional or known to be
@@ -30,158 +30,251 @@ wrong. Believe the box over the surrounding text.
 :::{warning}
 Row counts here were measured on 2026-08-23. The `ssp` database grew from 22 to 94
 billion rows in the six days before that. Re-query rather than trusting a number
-in this note; §13 shows how.
+in this note; *Operating the service* shows how.
 :::
 
 # Part I — Using the service
 
-## What mppdb is for
+## What mppdb holds, and why it exists
 
-Rubin produces large catalog datasets — prompt-processing products, preliminary
-data releases, per-visit source tables. They live in Butler collections and file
-exports. That works for pipelines and not for questions like "give me every row
-matching this, across everything, now". mppdb answers those questions.
+Four databases on one ClickHouse server, queried in ADQL:
 
-The immediate reason it exists is Solar System Processing. SSP needs the set of
-all sources that could be linked into a new asteroid discovery, or associated with
-a known one. Those sources sit in dozens of separate repositories and collections,
-and some no longer exist upstream at all. mppdb puts them in one table you can
-query in seconds.
+| database | what it holds | rows |
+|---|---|---|
+| `ssp` | per-visit source catalogs for Solar System Processing — eleven tables, one per processing run | 93.77 B |
+| `mppdb` | DP2 **prerelease** prompt products: DIA sources and objects, solar-system objects, MPC orbits | 25.74 B |
+| `ppdb` | a static snapshot of the Prompt Products Database — `DiaObject`, `DiaSource`, `DiaForcedSource` | 48.70 M |
+| `dp2` | the final DP2 release — **being loaded now**, will take over from `mppdb` | 86.55 B, 3 of 13 tables |
 
-Two of the `ssp` tables are recoveries: `source_nv_orphaned` holds 17,053 visits
-rebuilt from scratch FITS files after the nightlyValidation datasets were deleted
-from both repositories, and `dia_source_2025lost` holds 70 observations rebuilt
-from a submitted ADES file. The FITS files and that PSV file remain the canonical
-copies and need protecting (§16); mppdb makes them queryable, it does not replace
-them.
+:::{important}
+**"DP2" means three different things here**, which is worth untangling once.
+`mppdb` is a *prerelease* DP2 import and is what everything below queries today.
+`dp2` is the *final* release, loading as this is written; it is similar to `mppdb`
+— comparable row counts, some columns different and fewer — and will replace it.
+Separately, `ssp.source_dp2` and `ssp.dia_source_dp2` are per-visit source tables
+extracted from DP2. Timings in this note were measured against `mppdb` and should
+be re-run once `dp2` is in place.
+:::
 
-The same need shows up elsewhere, so the database is general rather than
-SSP-specific. Three datasets are in scope:
+Rubin produces catalog datasets faster than it gains places to analyse them. They
+live in Butler collections and file exports, which suits pipelines and not
+questions like "give me every row matching this, across everything, now". The
+immediate driver was Solar System Processing, which needs every source that could
+be linked into an asteroid discovery in one queryable table rather than spread
+across dozens of collections — some of which no longer exist upstream.
 
-| database | what it is for |
-|---|---|
-| `ssp` | Solar System Processing — the eligible-source working set |
-| `ppdb` | developing the SSP daily data products pipeline |
-| `dp2` *(planned)* | data-release analytics, loadable as soon as DP2 exists; the console demo will move here |
-
-`ppdb` is there to support the pipeline that will produce `sssource`, `ssobject`
-and `nearby_sso` for the Prompt Products Database, developed at
-[`mjuric/ssp`](https://github.com/mjuric/ssp). That pipeline does not use this
-database yet, so `ppdb` currently has no active reader.
-
-**The service on top does two things.** It provides a **TAP 1.1 interface**, so
-applications and standard VO tools query the database without anything bespoke.
-And it provides a **web console** for exploring what is in the database — write a
-query, see the table, draw a plot — which is how you find out what these datasets
-actually contain without writing a program.
+The service on top does two things: it provides a **TAP 1.1 interface**, so
+standard VO tools work without anything bespoke, and a **web console** for finding
+out what is actually in these datasets.
 
 ## Getting started
 
-Open <https://usdf-rsp-dev.slac.stanford.edu/mppdb/ui/>. Rubin SSO logs you in;
-your account is created on first visit. There is no signup and no password held by
-the service.
+Open <https://usdf-rsp-dev.slac.stanford.edu/mppdb/ui/>. Rubin SSO logs you in and
+your account is created on first visit. Anyone who can log in to `usdf-rsp-dev`
+can query.
 
-**Start with the demo notebook.** Every account gets one, called *Demo:
-Sky/Visit/Light Curve*. It is the fastest way to see what the service does: sixteen
-cells that begin with the whole sky, sort down to one active object, pull its light
-curve, and then plot every detection from a single visit. It also shows the feature
-that makes these notebooks more than a query box — `{{ }}` references, which feed a
-value from one cell's results into the next cell's query, so a chain of queries
-reads like an argument instead of a series of copy-pastes.
+**Start with the demo notebook.** Every account gets one, *Demo:
+Sky/Visit/Light Curve*: sixteen cells that begin with the whole sky, sort down to
+one active object, pull its light curve, then plot every detection from a single
+visit. Notebooks here speak ADQL, not Python; cells run top to bottom and remember
+what came before, and you can add plot and markdown cells.
 
-The console also has a query editor, a schema browser listing every table with its
-row count, and worked examples you can run and edit: a cone search, per-band
-detection counts, light curves, solar-system objects, and MPC orbital elements.
+They also support `{{ }}` references, which feed a value from one cell into the
+next query. If a cell named `many` returned a table, the next cell can say:
 
-Notebooks here speak ADQL rather than Python. Cells run top to bottom and remember
-what came before, and you can add plot cells and markdown cells alongside the
-queries.
+```text
+SELECT ra, dec, band, visit, midpointMjdTai, psfFlux, psfFluxErr
+FROM mppdb.DiaSource
+WHERE diaObjectId = {{ many.diaObjectId[0] }}
+```
 
 :::{important}
-The demo currently queries the `mppdb` database. When `dp2` is loaded it will move
-there, largely unchanged — the one difference being that `DiaObjectLast` goes away
-and `DiaObject` takes its place. Examples in this note that use
-`mppdb.DiaObjectLast` are tied to the current import for the same reason.
+The demo queries `mppdb` today. When `dp2` is loaded it will move there, largely
+unchanged, except that `DiaObjectLast` goes away and `DiaObject` takes over its
+role. Examples below that use `mppdb.DiaObjectLast` are tied to the current
+prerelease import for the same reason.
 :::
 
-For scripted access you need a token. Mint one in the RSP token page
-(`/settings/tokens/new`, scope `read:tap` only) and save it:
+For scripted access, mint a token at
+<https://usdf-rsp-dev.slac.stanford.edu/settings/tokens/new> with scope
+`read:tap`, then save it:
 
 ```
 (umask 077; cat > ~/.mppdb.token)   # paste the token, press Enter, then Ctrl-D
 ```
 
-That writes `~/.mppdb.token` readable only by you, and keeps the token out of your
-shell history.
+## Finding your way around the tables
 
-## What is in the database
+### `ssp` — eleven tables, one per processing run
 
-Measured 2026-08-23:
+Which table you want depends entirely on which processing run you care about. The
+row counts do not tell you that, and picking the biggest is a trap.
 
-| database | tables | rows | on disk |
-|---|---|---|---|
-| `ssp` | 11 | 93.77 B | 11.05 TiB |
-| `mppdb` | 12 | 25.74 B | 2.57 TiB |
-| `ppdb` | 3 | 48.70 M | 9.29 GiB |
+| table | rows | what it is |
+|---|---|---|
+| `source_daytime` | 43.54 B | single-visit star sources, LSSTCam Daytime AP reprocessing |
+| `source_dp2` | 20.66 B | single-visit sources, final DP2 release |
+| `source_nv` | 17.99 B | single-visit star sources, nightly validation |
+| `source_nv_orphaned` | 9.17 B | nightlyValidation-era sources recovered from scratch FITS; no upstream copy |
+| `dia_source_dp2_v30_0_0` | 1.26 B | DIA sources from a DP2 **prerelease — superseded** |
+| `dia_source_dp2` | 1.00 B | DIA sources, final DP2 release |
+| `dia_source_prompt` | 118 M | DIA sources, LSSTCam prompt processing |
+| `dia_source_rfl` | 16.9 M | DIA sources, DRP FL reprocessing (`w_2025_19`) |
+| `dia_source_dp1_48666` | 5.3 M | earlier DP1 test processing — the run the first asteroids were found in |
+| `dia_source_dp1` | 3.09 M | DIA sources, final DP1 release |
+| `dia_source_2025lost` | 70 | recovered from a submitted ADES file; no upstream copy |
 
-`mppdb` holds DP2 prompt products: `DiaSource`, `DiaObject`, `DiaObjectLast`,
-`DiaForcedSource`, `SSObject`, `SSSource`, `mpc_orbits` and related tables, with
-Felis datatypes, units and descriptions. `ppdb` holds the three PPDB tables.
-`ssp` holds per-visit source catalogs, one table per export — the four largest
-are `source_daytime` (43.54 B rows), `source_dp2` (20.66 B), `source_nv`
-(17.99 B) and `source_nv_orphaned` (9.17 B).
+:::{warning}
+Note rows five and six. `dia_source_dp2_v30_0_0` is a **superseded prerelease** and
+is *larger* than `dia_source_dp2`, the final release. Choosing by row count gets
+you the wrong data with no warning.
+:::
 
-The console's schema browser is the fastest way to see columns, units and
-descriptions. `SELECT * FROM TAP_SCHEMA.tables` gives the same thing in SQL.
+Every table's full description — naming the collection and run it came from — is in
+the schema browser and in `TAP_SCHEMA.tables`.
+
+### `mppdb` — twelve tables
+
+`DiaSource`, `DiaObject`, `DiaObjectLast`, `DiaForcedSource`,
+`DiaObject_To_Object_Match`, `DetectorVisitProcessingSummary`, `SSObject`,
+`SSSource`, `mpc_orbits`, `current_identifications`, `numbered_identifications`,
+`metadata`.
+
+Three of those repay knowing about:
+
+**`DiaObject` versus `DiaObjectLast`.** `DiaObject` is version *history*: it
+carries `validityStartMjdTai` and `validityEndMjdTai`, and can hold several rows
+per `diaObjectId`. Joining it without filtering on validity silently multi-counts
+objects. `DiaObjectLast` holds one row per object. Use `DiaObjectLast` unless you
+specifically want history.
+
+**`DetectorVisitProcessingSummary`** is the per-visit, per-detector image-quality
+table — 52 columns including `seeing`, `skyBg`, `zeroPoint`, `psfSigma`,
+`astromOffsetMean`, `nPsfStar`. It is what you join against when asking whether a
+detection anomaly tracks the observing conditions.
+
+**`mpc_orbits.designation` is the unpacked provisional designation** (e.g.
+`2008 AB`), not a number or a name. Numbers and names live in
+`numbered_identifications` (`permid`, `iau_designation`, `iau_name`), so looking up
+"(24) Themis" needs a join.
+
+`DiaObject_To_Object_Match` maps `diaObjectId` to `objectId` — but no `Object`
+table is loaded here, so the other side of that join does not exist yet.
+
+### Column meanings
+
+`mppdb` and `ppdb` columns carry units, UCDs and descriptions from Felis; the
+schema browser and `TAP_SCHEMA.columns` show them:
+
+```sql
+SELECT column_name, datatype, unit, ucd, description
+FROM TAP_SCHEMA.columns WHERE table_name = 'mppdb.DiaSource'
+```
+
+:::{important}
+**`ssp` columns have no descriptions or units** — 655 columns, all blank. The names
+come straight from the source parquet exports, which are the Butler
+`sourceTable`/`diaSourceTable` columns, so the Science Pipelines schema is the
+reference for what they mean. This includes the quality flags
+(`detect_isPrimary`, `sky_source`, `calib_psf_used`, `pixelFlags_*`,
+`invalidPsfFlag`), which behave as they do in the pipelines.
+:::
 
 ## Writing queries
 
-**Qualify table names.** Write `mppdb.DiaSource`, `ssp.source_nv`,
-`ppdb.DiaObject`. Only the default database resolves unqualified names, so
-qualifying always works.
+**Qualify table names**: `mppdb.DiaSource`, `ssp.source_nv`, `ppdb.DiaObject`.
+Only the default database resolves unqualified names.
 
-**Use `TOP` while exploring**, and prefer async for anything that might be slow.
-A sync query returns in the request; an async one becomes a job whose results are
-spooled and survive a disconnect. In pyvo that is `run_async` instead of `search`.
-
-### What is fast, and why it differs per table
+### What is fast
 
 Each table is physically sorted on one key. A query is fast when its filter
-matches that key, because the engine reads a slice instead of the whole table. The
-key is chosen per dataset to match how that dataset is used.
+matches that key, because the engine reads a slice instead of the whole table. In
+terms of what you write:
 
-| tables | sorted on | fast | slow |
-|---|---|---|---|
-| `mppdb.DiaSource`, `DiaObject`, `DiaObjectLast`, `DiaForcedSource`, `SSSource`; all `ppdb` tables | `hpix29` (position) | cone searches | large sweeps by id |
-| all `ssp` tables | `sourceId` / `diaSourceId` / `id` | lookups by id, and by visit — visit sits in the id's high bits, so one visit is one contiguous range | cone searches |
+| this is fast | on |
+|---|---|
+| `WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', …)) = 1` | `mppdb.*` and `ppdb.*` spatial tables — they are sorted by sky position |
+| `WHERE <idcol> = …` or `BETWEEN` on the id | all `ssp` tables — sorted by id |
+| `COUNT(*)` with no `WHERE` | anything — it is read from metadata, not scanned |
+| `GROUP BY band`, `WHERE band = 'r'` | anything — `band` is a low-cardinality column |
+| a join on **both** `visit` and `detector` | `mppdb.DiaSource` × `DetectorVisitProcessingSummary` |
 
-Measured against the live service:
+| this is slow | why |
+|---|---|
+| any cone search on `ssp.*` | the spatial columns exist so the query is *correct*, but nothing prunes it: expect a full scan, minutes on tens of billions of rows |
+| `WHERE visit = …` on `ssp.*` | there is a `visit` column but the table is not organised by it, so this scans. The fast path is an explicit id range, and ADQL here has no bitwise or integer-division functions to compute one from a visit number — so in practice, filter by id or accept the scan |
+| a join on `visit` alone | fans out across all detectors; the same query joined on `visit` **and** `detector` finished in 2.8 s where the `visit`-only version hit the 60 s limit |
+
+The id column differs per `ssp` table: `id` for `source_daytime`, `sourceId` for
+`source_nv`, `source_dp2` and `source_nv_orphaned`, `diaSourceId` for all seven
+`dia_source_*` tables.
+
+You never write `hpix29` yourself. It is the spatial sort key, it is hidden from
+the schema browser deliberately, and `CONTAINS(...)` is what puts it to work.
+
+Measured against the live service, on `mppdb`:
 
 | query | time |
 |---|---|
-| cone search, `mppdb.DiaObjectLast`, radius 0.5°, 1000 rows | **0.2 s** |
-| `COUNT(*)` on `ssp.source_nv` (17.99 B rows) | **0.2 s** |
-| id-ordered lookup, `ssp.dia_source_dp1` | **0.1 s** |
-| `GROUP BY band` with `AVG(snr)` over `mppdb.DiaSource` | **11.9 s** |
+| cone search, `DiaObjectLast`, radius 0.5°, `TOP 1000` with no `ORDER BY` | 0.2 s — this is time to the *first* 1000 rows, not the full cone |
+| `COUNT(*)` on `ssp.source_nv` (17.99 B rows) | 0.2 s — metadata, not a scan |
+| id-ordered lookup, `ssp.dia_source_dp1` | 0.1 s |
+| visit/detector join with `GROUP BY`, 704 rows out | 2.8 s |
+| `GROUP BY band` with `AVG(snr)` over `DiaSource`, no cuts | 11.9 s |
+| the same aggregate with quality cuts | 10.4 s |
 
-A cone search on an `ssp` table is a different matter: the spatial columns exist,
-so the query is correct, but nothing prunes it and the engine scans the table.
-Expect minutes on tens of billions of rows.
+### Limits you will hit
 
-`ssp` is sorted by id because that is what its main user asks for. The SSP
-submission tooling sends batches of 10⁴–10⁶ `(collection, id)` pairs, joins them
-server-side against a staged temporary table, and selects 19 columns. Its only
-whole-table work is offline verification, which goes visit by visit — served by
-the same ordering. It issues no spatial queries.
+| limit | value |
+|---|---|
+| rows returned, default | **50,000** |
+| rows returned, maximum | 2,000,000 |
+| sync query timeout | **60 s** |
+| async job timeout | 3600 s |
+| results kept | 7 days |
 
-This can change. ClickHouse supports projections, a second physical ordering of
-the same table, so a dataset that needs both patterns can have both at the cost of
-storage and ingest time. Nothing needs one today. If a use case starts needing
-fast cone searches over `ssp`, a projection is the answer rather than a redesign.
+:::{warning}
+**Truncation at 50,000 rows is reported as success**, not as an error — the
+response carries an `OVERFLOW` status. If you run an aggregate and get exactly
+50,000 rows back, check for it before believing that is the whole answer.
+:::
+
+Use `/sync` for interactive work and `/async` for anything that might exceed 60
+seconds — an async job is queued, its results are spooled, and it survives a
+disconnect. In pyvo that is `run_async` rather than `search`.
+
+**Not supported here**, and worth knowing before you assume you made a mistake:
+
+- **`TAP_UPLOAD`** — you cannot upload a table to join against. There is no
+  workaround through the service today.
+- **`WITH` / common table expressions** — rejected as `UNSUPPORTED_ADQL`.
+- **Correlated subqueries.**
+- **`ORDER BY` on a select-list alias** — write `ORDER BY COUNT(*) DESC`, not
+  `ORDER BY n_dia DESC`, which fails as `UNKNOWN_COLUMN`.
+- **`REGION`, `AREA`, `CENTROID`, `COORD1`, `COORD2`, `COORDSYS`**, and
+  region-in-region `CONTAINS` — point-in-region only.
+- Functions are an allowlist; `CAST` is restricted to scalar types.
+
+Joins, `GROUP BY`, `HAVING`, aggregates and point-in-region `CONTAINS` all work.
 
 ### Examples
 
-A cone search — fast, because `mppdb.DiaObjectLast` is spatially sorted:
+**Image quality against detection counts** — which visit/detector pairs threw
+anomalous numbers of r-band DIA detections, and does it track seeing or sky
+background? 2.8 s, 704 rows:
+
+```sql
+SELECT s.visit, s.detector, v.seeing, v.skyBg, v.zeroPoint, COUNT(*) AS n_dia
+FROM mppdb.DiaSource AS s
+JOIN mppdb.DetectorVisitProcessingSummary AS v
+  ON s.visit = v.visit AND s.detector = v.detector
+WHERE s.band = 'r'
+GROUP BY s.visit, s.detector, v.seeing, v.skyBg, v.zeroPoint
+HAVING COUNT(*) > 5000
+ORDER BY COUNT(*) DESC
+```
+
+**A cone search** — fast, because `DiaObjectLast` is sorted by position:
 
 ```sql
 SELECT TOP 1000 diaObjectId, ra, dec, nDiaSources, lastDiaSourceMjdTai
@@ -190,16 +283,19 @@ WHERE CONTAINS(POINT('ICRS', ra, dec),
                CIRCLE('ICRS', 53.13, -28.10, 0.5)) = 1
 ```
 
-Detections per band, with mean signal-to-noise — a full aggregate, 11.9 s:
+**Detections per band, with quality cuts.** Without the cuts the mean is dominated
+by dipoles, streaks and edge artifacts — in g band the cuts take 175.7 M
+detections down to 1.4 M:
 
 ```sql
 SELECT band, COUNT(*) AS n_detections, AVG(snr) AS mean_snr
 FROM mppdb.DiaSource
+WHERE reliability > 0.9 AND isDipole = 0
 GROUP BY band
 ORDER BY band
 ```
 
-A forced-photometry light curve for one object:
+**A forced-photometry light curve** for one object:
 
 ```sql
 SELECT midpointMjdTai, band, psfFlux, psfFluxErr
@@ -208,7 +304,30 @@ WHERE diaObjectId = 744858242361853537
 ORDER BY midpointMjdTai
 ```
 
-Main-belt orbits from the MPC elements table:
+**Solar-system astrometric residuals against the ephemeris** — the standard SSP QA
+plot. Run this async; it exceeded the sync limit when tested:
+
+```sql
+SELECT ss.diaSourceId, ds.midpointMjdTai, ds.band,
+       ss.ephOffsetAlongTrack, ss.ephOffsetCrossTrack, ss.phaseAngle
+FROM mppdb.SSSource AS ss
+JOIN mppdb.DiaSource AS ds ON ss.diaSourceId = ds.diaSourceId
+WHERE ss.designation = '2008 AB'
+ORDER BY ds.midpointMjdTai
+```
+
+**Orbital elements for a numbered object**, which needs the identification join:
+
+```sql
+SELECT n.permid, n.iau_name, o.a, o.q, o.e, o.i, o.epoch_mjd
+FROM mppdb.mpc_orbits AS o
+JOIN mppdb.numbered_identifications AS n
+  ON n.unpacked_primary_provisional_designation = o.designation
+WHERE n.permid = '24'
+```
+
+A crude main-belt box, if you want elements in bulk — a selection, not a
+definition:
 
 ```sql
 SELECT TOP 1000 designation, a, q, e, i, argperi, node, epoch_mjd
@@ -216,14 +335,26 @@ FROM mppdb.mpc_orbits
 WHERE a BETWEEN 2.1 AND 3.3 AND e < 0.25
 ```
 
-The console ships these and others, ready to run.
+The console ships several of these ready to run.
+
+## Getting results out
+
+Async results can be retrieved as **VOTable, CSV or Parquet** — add
+`?FORMAT=csv` or `?FORMAT=parquet` when fetching a job's result. The service can
+also mint a **download link** for a result, which `curl`, `wget` or TOPCAT can
+fetch without your session.
+
+There is also a **Simple Cone Search** endpoint, `/scs/{table}?RA=&DEC=&SR=`, if
+you have an SCS client already.
 
 ## TOPCAT and pyvo
 
 The TAP endpoint is `https://usdf-rsp-dev.slac.stanford.edu/mppdb`.
 
-In **TOPCAT**, enter that as the TAP URL. For authentication use your token as the
-HTTP Basic *username* with `x-oauth-basic` as the password.
+In **TOPCAT**: enter that as the TAP URL. TOPCAT will not ask for credentials
+until the service returns a 401, so expect the prompt to appear after your first
+action rather than up front. Give your token as the HTTP Basic *username*, with
+`x-oauth-basic` as the password.
 
 In **pyvo**:
 
@@ -245,17 +376,14 @@ print(job.to_table())
 
 ## Things to know
 
-**Your account is local to this service.** Users, sessions, tokens, quotas and job
-history live in this deployment. A token minted here works here.
+Your account, tokens, quotas and job history belong to this service; a token
+minted here works here.
 
-**One table is missing from TAP.** `ssp.SubmittableSources` is a view over all
-eleven `ssp` tables, used by the SSP submission portal, which reads ClickHouse
-directly. It is absent from `/tables` by oversight rather than by design and is
-expected to be added. If you compare `/tables` against the database and find one
-extra object, that is why.
+`ssp.SubmittableSources`, a view over all eleven `ssp` tables, is not advertised
+over TAP yet.
 
-**Async jobs and results are per-user**, with quotas on concurrency and spool
-space. The console shows your jobs.
+Async jobs are per-user, with quotas on concurrency and spool space. The console
+lists yours.
 
 # Part II — Operations and internals
 
@@ -292,17 +420,19 @@ service reaches it over the network.
 The ideal deployment is one containerized application under Argo CD — server,
 ingest and service together, with no node to maintain by hand. Filesystem
 performance in Kubernetes is what blocks it, not anything about mppdb. Until that
-changes, the node is necessary and should not be moved into the cluster. See §17.
+changes, the node is necessary and should not be moved into the cluster. See
+*What production would require*.
 :::
 
 The unit of operation between the two parts is the catalog: a publish on the
 backend changes what the service should serve, and the service picks it up only
-when reloaded (§13).
+when reloaded — see *Operating the service*.
 
 ## The data: provenance and lifecycle
 
-**`mppdb`** is the original science import: DP2 prompt products mapped onto a
-curated registry generated from the vendored Felis `apdb.yaml`. Datatypes, units,
+**`mppdb`** is the original science import: DP2 prompt products — a **prerelease**
+of the release now loading as `dp2` — mapped onto a curated registry generated
+from the vendored Felis `apdb.yaml`. Datatypes, units,
 UCDs and descriptions come from Felis; `hpix29`/`cx`/`cy`/`cz` spatial columns,
 principal flags and foreign keys were added. The three large DIA tables came from
 flat DP2 HATS exports via `mppdb ingest --from-hats`, which maps columns onto that
@@ -341,8 +471,13 @@ server's node-local `user_files` directory.
 
 :::{important}
 A fourth database, `dp2` — thirteen DP2 release products, about 91.4 B rows — is
-planned and approved, waiting on the export. `ssp`'s ingest configs, loads and
-catalog content are owned by the ssp-submit project, not by the service.
+**loading now**: the three largest tables are in (`ForcedSource` 44.73 B,
+`ForcedSourceOnDiaObject` 24.26 B, `Source` 17.57 B, 86.55 B together as of
+2026-08-24) and the remaining ten are pending. It is not yet granted to the
+service's read-only user, so it is not queryable through TAP. When it is complete
+it takes over from `mppdb`, and the timings in this note should be re-measured
+against it. `ssp`'s ingest configs, loads and catalog content are owned by the
+ssp-submit project, not by the service.
 :::
 
 ## Ingest and query performance
@@ -446,7 +581,7 @@ is what makes publishing and reloading checkable instead of assumed.
 
 Everything that writes lives on `sdfiana035`, inside an apptainer sandbox whose
 root filesystem is a writable directory on WekaFS. It is here rather than in
-Kubernetes for the reason in §8.
+Kubernetes for the reason given under *Architecture*.
 
 **ClickHouse** runs there as a plain daemon. There is no systemd in the container
 and no automatic restart after a host reboot; bringing it back is a documented
@@ -588,7 +723,8 @@ agreeing is the minimum evidence, and the reasoning belongs in a comment.
 Symptoms that have happened, with causes.
 
 The service advertises tables whose queries fail
-: Its catalog predates a retirement. Compare store and served (§13.1), then
+: Its catalog predates a retirement. Compare store and served (*Is the service
+  serving the current catalog?*), then
   `mppdb reload --wait`. The catalog looks healthy throughout, which is what makes
   this one hard to notice.
 
@@ -659,7 +795,7 @@ Ordered by how much they should worry a new owner.
    store, so `ppdb` catalog updates are hand-run. `catalog publish` has no
    compare-and-set staleness guard, so a stale local document can revert curated
    metadata; operator convention is the current mitigation.
-8. **`ssp.SubmittableSources` is not advertised over TAP** (§7), an omission rather
+8. **`ssp.SubmittableSources` is not advertised over TAP**, an omission rather
    than a decision.
 9. **Single-operator knowledge.** The mppdb repository's runbooks are good, but
    this note is the first document an outside operator could start from.
