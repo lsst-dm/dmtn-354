@@ -21,10 +21,11 @@ million rows about 9 minutes. River can be thought of as APDB, PPDB and Qserv
 rolled into one, with update capability.
 
 It exists to give Solar System Processing — and Rubin catalog QA generally —
-somewhere to run SQL across a whole dataset. Two of these databases back
-production work: `ssp` is what the solar-system group's MPC submissions are drawn
-from, and `ppdb` is where the solar-system tables delivered to Rubin's official
-Prompt Products Database will be built. The intent is therefore to keep the
+somewhere to run SQL across a whole dataset before it reaches an official
+database, and somewhere to query the ones that never will. Two of these
+databases back production work: `ssp` is what the solar-system group's MPC
+submissions are drawn from, and `ppdb` is where the solar-system tables
+delivered to Rubin's official Prompt Products Database will be built. The intent is therefore to keep the
 contents current — refreshed at least daily, and in near-real time as each night's
 data arrives. The first half of this note is for people using the service; the
 second half is for people running it.
