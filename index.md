@@ -2,11 +2,22 @@
 
 ```{abstract}
 mppdb is a SQL analytics database for Rubin catalog data, with a TAP 1.1 service
-in front of it. It holds about 120 billion rows across three databases on one
-ClickHouse server at the USDF, and you query it in ADQL from TOPCAT, pyvo, or its
-own web console. It exists to give Solar System Processing — and Rubin catalog QA
-generally — somewhere to run SQL across a whole dataset. The first half of this
-note is for people using the service; the second half is for people running it.
+providing an ADQL/TAP API and a web UI over it. It holds **120 billion rows**
+across three databases on one ClickHouse server at the USDF, with a fourth of
+**91 billion** loading, and you query it from TOPCAT, pyvo, or its own web
+console.
+
+It is fast enough to use interactively at that scale. Indexed lookups return in
+**a fraction of a second**, aggregates over a billion rows in **2–12 seconds**,
+and the slowest case measured — an unindexed cone search across **18 billion
+rows** — in **five minutes**. Ingest is on the same footing: a release-scale
+dataset goes from a Butler repository to a queryable table in **hours**, at about
+**200 million rows per minute** into ClickHouse, and nightly appends extend it
+**incrementally, in minutes**.
+
+It exists to give Solar System Processing — and Rubin catalog QA generally —
+somewhere to run SQL across a whole dataset. The first half of this note is for
+people using the service; the second half is for people running it.
 ```
 
 ## Scope and status
