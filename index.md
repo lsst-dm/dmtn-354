@@ -1,21 +1,20 @@
 # River: A Fast, Scalable, Evergreen SQL and TAP Database of Rubin Prompt, Data Release, Nightly Validation and Solar System Catalogs
 
 ```{abstract}
-River is a SQL analytics database for Rubin catalog data, with a [TAP 1.1](https://www.ivoa.net/documents/TAP/) service
-providing an [ADQL](https://www.ivoa.net/documents/ADQL/)/TAP API and a web UI
-over it. It holds **185 billion rows**
-across three databases on one [ClickHouse](https://clickhouse.com/) server at the USDF — the DP2 data
-release, the Solar System Processing working set, and a Prompt Products snapshot
-— and you query it from [TOPCAT](https://www.star.bris.ac.uk/~mbt/topcat/), [pyvo](https://pyvo.readthedocs.io/), or its own web UI. River is the
-deployment; `mppdb` is the software it runs, which is why that name persists
-throughout its configuration and tooling.
+River is a SQL analytics database for Rubin catalog data, with a
+[TAP 1.1](https://www.ivoa.net/documents/TAP/) service providing an
+[ADQL](https://www.ivoa.net/documents/ADQL/)/TAP API and a web UI over it. It holds **185 billion rows** across three databases (updated nightly
+with new data from AP and NV pipelines) on one
+[ClickHouse](https://clickhouse.com/) server at the USDF — the DP2 data release,
+the Solar System Processing working set, and a Prompt Products snapshot — and you
+query it from [TOPCAT](https://www.star.bris.ac.uk/~mbt/topcat/),
+[pyvo](https://pyvo.readthedocs.io/), or its own web UI.
 
-It is fast enough to use interactively at that scale. Indexed lookups and
-sky-position cone searches return in **under a second**, aggregates over a
-billion rows in **a few seconds**, and the slowest case measured — an
-*unindexed* cone search across **18 billion rows**, where the whole table has to
-be read — in
-**three to five minutes**. Ingest is on the same footing: a release-scale
+It is generally fast enough to enable exploratory data analysis at scale.
+Indexed lookups and sky-position cone searches return in **under a second**,
+aggregates over a billion rows in **a few seconds**, and the slowest case
+measured — an *unindexed* cone search across **18 billion rows**, where the whole
+table has to be read — in **three to five minutes**. Ingest is on the same footing: a release-scale
 dataset goes from a Butler repository to a queryable table in **hours**, at about
 **200 million rows per minute** into ClickHouse, and nightly appends extend it
 **incrementally**: a no-op nightly pass costs 24 s and a real append of 118.5
@@ -46,11 +45,6 @@ describes what is deployed, not what is planned.
 it. **Part II — Operations and internals**, which is a draft for the service
 operator only, covers how it is built, how to run it, and what would have to
 change for production.
-
-Row counts here were measured on 2026-08-24. `ssp` grows fast enough that they
-date quickly, so re-query rather than trusting a number in this note:
-`SELECT COUNT(*) FROM ssp.source_nv` is read from metadata and returns in about
-0.2 s.
 
 ## Part I — Using the service
 
@@ -137,22 +131,6 @@ Not currently supported: `TAP_UPLOAD`; `WITH`/CTEs; correlated subqueries;
 `CASE`; `COUNTIF`; string functions including `SUBSTRING`; `ORDER BY` on a select-list alias (write
 `ORDER BY COUNT(*) DESC`, not `ORDER BY n_dia DESC`); and
 `REGION`/`AREA`/`CENTROID`/`COORD1`/`COORD2`/`COORDSYS`.
-
-:::{warning}
-**A query carries at most about 1,000 literal values.** With `TAP_UPLOAD`
-unsupported, an explicit `id IN (…)` is the obvious substitute, and it works —
-up to a point. Every literal becomes a typed ClickHouse query parameter sent as
-an HTTP form field, and the server caps those at 1,000 (`http_max_fields`).
-Measured: 1,000 ids succeed, 1,200 fail with
-`Poco::Exception … HTML Form Exception: Too many form fields`, which says nothing
-about ids or limits.
-
-The ceiling is on the *count* of literals, not the length of the query — a query
-can be tens of kilobytes of text and be fine. Beyond that, the transport limits
-bite well before ClickHouse's own `max_query_size` (256 KiB): a `GET /sync` URL
-is refused with HTTP 400 somewhere past 50 kB of query text, and a `POST` body
-fails around 250 kB.
-:::
 
 
 ### Python and API access
