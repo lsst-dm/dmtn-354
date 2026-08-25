@@ -3,23 +3,25 @@
 ```{abstract}
 River is a SQL analytics database for Rubin catalog data, with a
 [TAP 1.1](https://www.ivoa.net/documents/TAP/) service providing an
-[ADQL](https://www.ivoa.net/documents/ADQL/)/TAP API and a web UI over it. It holds **185 billion rows** across three databases (updated nightly
-with new data from AP and NV pipelines) on one
+[ADQL](https://www.ivoa.net/documents/ADQL/)/TAP API and a web UI over it. It
+holds 185 billion rows across three databases (updated nightly with new data
+from AP and NV pipelines) on one
 [ClickHouse](https://clickhouse.com/) server at the USDF — the DP2 data release,
 the Solar System Processing working set, and a Prompt Products snapshot — and you
 query it from [TOPCAT](https://www.star.bris.ac.uk/~mbt/topcat/),
 [pyvo](https://pyvo.readthedocs.io/en/latest/), or its own web UI.
 
 It is generally fast enough to enable exploratory data analysis at scale.
-Indexed lookups and sky-position cone searches return in **under a second**,
-aggregates over a billion rows in **a few seconds**, and the slowest case
-measured — an *unindexed* cone search across **18 billion rows**, where the whole
-table has to be read — in **three to five minutes**. Ingest is on the same footing: a release-scale
-dataset goes from a Butler repository to a queryable table in **hours**, at about
-**200 million rows per minute** into ClickHouse, and nightly appends extend it
-**incrementally**: a no-op nightly pass costs 24 s and a real append of 118.5
-million rows about 9 minutes. River can be thought of as APDB, PPDB and [Qserv](https://qserv.lsst.io/)
-rolled into one, with update capability.
+Indexed lookups and sky-position cone searches return in under a second,
+aggregates over a billion rows in a few seconds, and the slowest case
+measured — an *unindexed* cone search across 18 billion rows, where the whole
+table has to be read — in three to five minutes. Ingest is on the same footing:
+a release-scale dataset goes from a Butler repository to a queryable table in
+hours, at about
+200 million rows per minute into ClickHouse, and nightly appends extend it
+incrementally: a no-op nightly pass costs 24 s and a real append of 118.5
+million rows about 9 minutes. River can be thought of as APDB, PPDB and
+[Qserv](https://qserv.lsst.io/) rolled into one, with update capability.
 
 It exists to give Solar System Processing — and Rubin catalog QA generally —
 somewhere to run SQL across a whole dataset before it reaches an official
