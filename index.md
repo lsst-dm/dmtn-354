@@ -1,23 +1,25 @@
 # River: A Fast, Scalable, Evergreen SQL and TAP Database of Rubin Prompt, Data Release, Nightly Validation and Solar System Catalogs
 
 ```{abstract}
-River is a SQL analytics database for Rubin catalog data, with a TAP 1.1 service
-providing an ADQL/TAP API and a web UI over it. It holds **185 billion rows**
-across three databases on one ClickHouse server at the USDF — the DP2 data
+River is a SQL analytics database for Rubin catalog data, with a [TAP 1.1](https://www.ivoa.net/documents/TAP/) service
+providing an [ADQL](https://www.ivoa.net/documents/ADQL/)/TAP API and a web UI
+over it. It holds **185 billion rows**
+across three databases on one [ClickHouse](https://clickhouse.com/) server at the USDF — the DP2 data
 release, the Solar System Processing working set, and a Prompt Products snapshot
-— and you query it from TOPCAT, pyvo, or its own web UI. River is the
+— and you query it from [TOPCAT](https://www.star.bris.ac.uk/~mbt/topcat/), [pyvo](https://pyvo.readthedocs.io/), or its own web UI. River is the
 deployment; `mppdb` is the software it runs, which is why that name persists
 throughout its configuration and tooling.
 
 It is fast enough to use interactively at that scale. Indexed lookups and
 sky-position cone searches return in **under a second**, aggregates over a
 billion rows in **a few seconds**, and the slowest case measured — an
-*unindexed* cone search across **18 billion rows**, where nothing prunes — in
+*unindexed* cone search across **18 billion rows**, where the whole table has to
+be read — in
 **three to five minutes**. Ingest is on the same footing: a release-scale
 dataset goes from a Butler repository to a queryable table in **hours**, at about
 **200 million rows per minute** into ClickHouse, and nightly appends extend it
 **incrementally**: a no-op nightly pass costs 24 s and a real append of 118.5
-million rows about 9 minutes. River can be thought of as APDB, PPDB and Qserv
+million rows about 9 minutes. River can be thought of as APDB, PPDB and [Qserv](https://qserv.lsst.io/)
 rolled into one, with update capability.
 
 It exists to give Solar System Processing — and Rubin catalog QA generally —
@@ -41,20 +43,14 @@ not come back on its own after a host reboot. It is in real use anyway. This not
 describes what is deployed, not what is planned.
 
 **Part I — Using the service** covers what is in the database and how to query
-it. **Part II — Operations and internals** covers how it is built, how to run it,
-and what would have to change for production.
+it. **Part II — Operations and internals**, which is a draft for the service
+operator only, covers how it is built, how to run it, and what would have to
+change for production.
 
-:::{important}
-**Current status** boxes like this one flag something provisional or known to be
-wrong. Believe the box over the surrounding text.
-:::
-
-:::{warning}
 Row counts here were measured on 2026-08-24. `ssp` grows fast enough that they
 date quickly, so re-query rather than trusting a number in this note:
 `SELECT COUNT(*) FROM ssp.source_nv` is read from metadata and returns in about
 0.2 s.
-:::
 
 ## Part I — Using the service
 
@@ -77,31 +73,34 @@ Then use the web UI, which is built to be explored rather than documented:
 - **Worked example queries ship with it.** Start from those rather than from
   anything written here.
 
-Two things about the ADQL notebooks that are not visible from them: they run
+One thing about the ADQL notebooks that is not visible from them: they run
 **every query asynchronously**, so a notebook query gets the 3600 s limit rather
-than the 60 s one; and the demo notebook is `dp2`-qualified, but you only get that
-version if your notebook list is empty when you first look. An account created
-before
-2026-08-24 still holds the old one, whose unqualified queries no longer resolve —
-delete it and reload to be re-seeded.
+than the 60 s in force for the synchronous TAP API (see the Limits section
+below).
 
 ### What is in it
 
 | database | what it holds | rows |
 |---|---|---|
-| `ssp` | per-visit source catalogs for Solar System Processing — eleven tables, one per processing run | 93.77 B |
 | `dp2` | the DP2 data release: thirteen tables, among them `Object`, `Source`, `DiaSource`, `ForcedSource` | 91.44 B |
 | `ppdb` | a static snapshot of the Prompt Products Database | 48.70 M |
+| `ssp` | per-visit source catalogs for Solar System Processing — eleven tables, one per processing run | 93.77 B |
 
-**Every table reference must be qualified** — `dp2.DiaSource`, `ssp.source_nv`.
+`dp2` and `ppdb` are static. Three of the `ssp` tables — `source_daytime`,
+`source_nv` and `dia_source_prompt` — are **updated daily**, so a query against
+them today can return rows that were not there yesterday. The other eight `ssp`
+tables are frozen.
+
+**Every table reference must be qualified in ADQL queries you write** —
+`dp2.DiaSource`, `ssp.source_nv`.
 There is no default database, so a bare `FROM DiaSource` is rejected with
 `table 'DiaSource' must be schema-qualified`. That is deliberate: no one of these
 is the natural home for an unqualified name.
 
-`dp2` and `ssp` are organised differently, and it decides which of your queries
-are fast. `dp2` is **sorted by sky position**, so cone and region searches are its
-indexed access path. `ssp` is **sorted by id**, so id lookups and ranges are
-indexed there and a cone search is a full scan — correct, but minutes rather than
+`dp2` and `ssp` are organised differently, and that decides which of your queries
+are fast. `dp2` is **sorted by sky position**, so spatial searches are fast.
+`ssp` is **sorted by id**, so lookups and ranges on the id are fast, but a
+spatial search has to read the whole table — correct, and minutes rather than
 milliseconds.
 
 Two things in `dp2` will surprise you if you `SELECT *`: `Object` has **1,225
@@ -129,9 +128,13 @@ error — the response carries an `OVERFLOW` status. If a sync result is exactly
 50,000 / 2,000,000 and give no hint that async is a billion.
 :::
 
-Not supported, and the failures are cryptic enough to be worth listing:
-`TAP_UPLOAD`; `WITH`/CTEs; correlated subqueries; `CASE`; `COUNTIF`; string
-functions including `SUBSTRING`; `ORDER BY` on a select-list alias (write
+Supported: joins, **including across databases**; `GROUP BY` and `HAVING`;
+`POINT`, `CIRCLE`, `POLYGON`, `BOX`, `CONTAINS`, `INTERSECTS`, `DISTANCE`; and the
+usual numeric functions. Fluxes are nJy, so magnitudes are
+`-2.5 * LOG10(psfFlux) + 31.4`.
+
+Not currently supported: `TAP_UPLOAD`; `WITH`/CTEs; correlated subqueries;
+`CASE`; `COUNTIF`; string functions including `SUBSTRING`; `ORDER BY` on a select-list alias (write
 `ORDER BY COUNT(*) DESC`, not `ORDER BY n_dia DESC`); and
 `REGION`/`AREA`/`CENTROID`/`COORD1`/`COORD2`/`COORDSYS`.
 
@@ -151,21 +154,12 @@ is refused with HTTP 400 somewhere past 50 kB of query text, and a `POST` body
 fails around 250 kB.
 :::
 
-Supported and easy to assume otherwise: joins, **including across databases**;
-`GROUP BY` and `HAVING`; `POINT`, `CIRCLE`, `POLYGON`, `BOX`, `CONTAINS`,
-`INTERSECTS`, `DISTANCE`; and the usual numeric functions. Fluxes are nJy, so
-magnitudes are `-2.5 * LOG10(psfFlux) + 31.4`.
 
-### Scripted access
+### Python and API access
 
 The TAP endpoint is `https://usdf-rsp-dev.slac.stanford.edu/river`. Mint a token
 at <https://usdf-rsp-dev.slac.stanford.edu/settings/tokens/new> with scope
 `read:tap`. It is an RSP token; the service does not issue its own.
-
-In **TOPCAT**, enter the endpoint as the TAP URL. TOPCAT will not prompt for
-credentials until the service returns a 401, so the prompt appears after your
-first action rather than up front. Give the token as the HTTP Basic *username*
-with `x-oauth-basic` as the password.
 
 In **pyvo**, use `run_async` rather than `search` for anything that might take
 more than a minute:
@@ -183,6 +177,11 @@ service = pyvo.dal.TAPService(
 job = service.run_async("SELECT TOP 10 * FROM ssp.dia_source_dp1")
 print(job.to_table())
 ```
+
+In **TOPCAT**, enter the endpoint as the TAP URL. TOPCAT will not prompt for
+credentials until the service returns a 401, so the prompt appears after your
+first action rather than up front. Give the token as the HTTP Basic *username*
+with `x-oauth-basic` as the password.
 
 Results come back as **VOTable, CSV or Parquet**; `fits`, `tsv` and `json` are
 rejected, and `/capabilities` advertises only the VOTable serialisations, so a
@@ -208,7 +207,24 @@ an issue against the mppdb repository.
 `ssp.SubmittableSources`, a view over all eleven `ssp` tables, is not advertised
 over TAP yet.
 
-## Part II — Operations and internals
+## Part II — Operations and internals (DRAFT)
+
+:::{danger}
+**Do not run any command in Part II unless you are the service operator.** That
+is currently **mjuric**, and only one person can hold it: the service is a single
+replica with a single-writer state database, and the backend accepts a publish
+from one node only.
+
+The commands here are not read-only diagnostics. They restart the service, swap
+what every user's queries resolve against, and in some cases delete data that has
+no backup. Several are irreversible, and one of them — deleting a namespace —
+destroys a volume whose reclaim policy discards it. Running them concurrently
+with the operator is how you corrupt state rather than merely duplicate work.
+
+This part is also **draft**: it describes a pilot that is still changing, and
+commands may lag the deployment. If you need something done here, ask the
+operator rather than reproducing it.
+:::
 
 ### Architecture
 
@@ -216,7 +232,8 @@ Two parts:
 
 - a **backend** on `sdfiana035`: the ClickHouse server, the ingest tooling, and
   the catalog store. All writes happen here.
-- the **service**: the `river` Phalanx application on `usdf-rsp-dev`. It provides
+- the **service**: the `river` [Phalanx](https://phalanx.lsst.io/) application on
+  `usdf-rsp-dev`. It provides
   the TAP API and the web UI. It reads the backend and owns no data.
 
 ```{mermaid}
@@ -233,14 +250,16 @@ flowchart TB
 ```
 
 **Why it is split.** The service runs on Phalanx because Phalanx supplies what a
-user-facing service needs: Gafaelfawr authentication, container builds, ingress and
+user-facing service needs: [Gafaelfawr](https://gafaelfawr.lsst.io/) authentication,
+container builds, ingress and
 TLS, secret management, and a reviewable deploy path. The backend cannot run there.
 WekaFS reaches this Kubernetes environment over NFS, and NFS is too slow for the
 data path. So the backend runs on a node where WekaFS is mounted natively, and the
 service reaches it over the network.
 
 :::{important}
-The ideal deployment is one containerized application under Argo CD — server,
+The ideal deployment is one containerized application under
+[Argo CD](https://argo-cd.readthedocs.io/) — server,
 ingest and service together, with no node to maintain by hand. Filesystem
 performance in Kubernetes is what blocks it, not anything about mppdb. Until that
 changes, the node is necessary and should not be moved into the cluster. See
@@ -256,8 +275,9 @@ when reloaded — see *Operating the service*.
 **`dp2`** is the DP2 data release: thirteen tables, **91.44 B rows** — `Object`,
 `Source`, `DiaSource`, `DiaObject`, `ForcedSource`, `ForcedSourceOnDiaObject`,
 `Visit`, `CcdVisit`, `SSObject`, `SSSource`, `mpc_orbits`, `object_shear_all`,
-`isolated_star_stellar_motions`. Felis-named and `hpix29`-ordered, so cone
-searches prune. It is loaded from flat HATS exports with
+`isolated_star_stellar_motions`. [Felis](https://felis.lsst.io/)-named and
+`hpix29`-ordered, so spatial
+searches are fast. It is loaded from flat HATS exports with
 `mppdb ingest --from-hats`, which maps columns onto a curated registry rather
 than generating a schema: datatypes, units, UCDs and descriptions come from
 Felis, while the `hpix29`/`cx`/`cy`/`cz` spatial columns, the principal flags and
@@ -372,7 +392,7 @@ The other half of the requirement: queries must return quickly at these row
 counts. What makes that possible is that each table is physically sorted on the
 key its queries filter by, so the engine reads a slice rather than scanning.
 
-- `dp2.*` and `ppdb.*` are sorted on **`hpix29`**, a HEALPix index, with
+- `dp2.*` and `ppdb.*` are sorted on **`hpix29`**, a [HEALPix](https://healpix.sourceforge.io/) index, with
   `cx`/`cy`/`cz` alongside. ADQL `CONTAINS(POINT(...), CIRCLE(...))` is rewritten
   onto that index, so a cone reads only the relevant ranges. `hpix29` is hidden
   from the schema browser deliberately — users never write it.
@@ -452,7 +472,7 @@ configuration is not an input to the derivation — the store is.
 
 The store keeps the YAML, not just the five tables, because TAP_SCHEMA is a lossy
 projection. The registry's `physical` block — the spatial binding and HEALPix depth
-that drive cone-search pruning — has no column in the VO-standard tables.
+that make spatial searches fast — has no column in the VO-standard tables.
 
 **Generation** advances only when the store changes. A byte-identical publish is a
 no-op that still rederives the five tables, which makes `catalog publish` the
