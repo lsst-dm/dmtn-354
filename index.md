@@ -8,7 +8,7 @@ with new data from AP and NV pipelines) on one
 [ClickHouse](https://clickhouse.com/) server at the USDF — the DP2 data release,
 the Solar System Processing working set, and a Prompt Products snapshot — and you
 query it from [TOPCAT](https://www.star.bris.ac.uk/~mbt/topcat/),
-[pyvo](https://pyvo.readthedocs.io/), or its own web UI.
+[pyvo](https://pyvo.readthedocs.io/en/latest/), or its own web UI.
 
 It is generally fast enough to enable exploratory data analysis at scale.
 Indexed lookups and sky-position cone searches return in **under a second**,
@@ -237,7 +237,7 @@ service reaches it over the network.
 
 :::{important}
 The ideal deployment is one containerized application under
-[Argo CD](https://argo-cd.readthedocs.io/) — server,
+[Argo CD](https://argo-cd.readthedocs.io/en/stable/) — server,
 ingest and service together, with no node to maintain by hand. Filesystem
 performance in Kubernetes is what blocks it, not anything about mppdb. Until that
 changes, the node is necessary and should not be moved into the cluster. See
