@@ -69,6 +69,19 @@ Then use the web UI, which is built to be explored rather than documented:
 - **Worked example queries ship with it.** Start from those rather than from
   anything written here.
 
+:::{figure} _static/river-ui.png
+:alt: The River web UI: a schema browser listing 27 tables on the left, an ADQL notebook in the centre with query cells and results inline, and an all-sky density plot rendered from 232 million rows.
+:width: 100%
+:name: fig-river-ui
+
+The River web UI. Left: the schema browser, listing all 27 tables across the
+three databases with row counts. Centre: an ADQL notebook — markdown and query
+cells with results inline. The plot cell shown renders an all-sky HEALPix density
+map of all 232,004,216 `dp2.DiaObject` rows server-side, in 107 s; plot cells run
+over every row rather than a sample. Top left: the Python and TOPCAT access
+panels.
+:::
+
 One thing about the ADQL notebooks that is not visible from them: they run
 **every query asynchronously**, so a notebook query gets the 3600 s limit rather
 than the 60 s in force for the synchronous TAP API (see the Limits section
