@@ -173,8 +173,8 @@ print(job.to_table())
 
 In **TOPCAT**, enter the endpoint as the TAP URL. TOPCAT will not prompt for
 credentials until the service returns a 401, so the prompt appears after your
-first action rather than up front. Give the token as the HTTP Basic *username*
-with `x-oauth-basic` as the password.
+first action rather than up front. Give the literal `x-oauth-basic` as the HTTP
+Basic *username* and your token as the *password*.
 
 Results come back as **VOTable, CSV or Parquet**; `fits`, `tsv` and `json` are
 rejected, and `/capabilities` advertises only the VOTable serialisations, so a
