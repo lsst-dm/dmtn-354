@@ -661,10 +661,12 @@ The service advertises tables whose queries fail
   this one hard to notice.
 
 `mppdb reload --wait` times out (exit 3)
-: Unknown, not failed — the reload may have landed. Check `/catalog`. On
-  deployments where a proxy strips a URL prefix, older builds polled the wrong
-  local URL and always timed out; `--url http://127.0.0.1:8080` is the workaround,
-  fixed upstream.
+: Unknown, not failed — the reload may have landed. Check `/catalog`. The tool
+  derives its poll URL by joining the *public* path prefix to a *local* host, so
+  where a proxy strips that prefix it polls `http://127.0.0.1:8080/river/catalog`
+  while the pod serves `/catalog`, and never gets an answer. Pass
+  `--url http://127.0.0.1:8080` to poll the path the pod actually serves. Still
+  required on the deployed image.
 
 The service refuses to start, complaining about the catalog
 : By design there is no fallback: a missing, empty, unparseable, duplicated or
