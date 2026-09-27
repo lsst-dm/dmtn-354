@@ -19,8 +19,8 @@ table has to be read — in three to five minutes. Ingest is on the same footing
 a release-scale dataset goes from a Butler repository to a queryable table in
 hours, at about
 200 million rows per minute into ClickHouse, and nightly appends extend it
-incrementally: a no-op nightly pass costs 24 s and a real append of 118.5
-million rows about 9 minutes. River can be thought of as APDB, PPDB and
+incrementally in minutes — nightly appends read freshly-written, cache-resident
+data, which is what makes them cheap. River can be thought of as APDB, PPDB and
 [Qserv](https://qserv.lsst.io/) rolled into one, with update capability.
 
 It exists to give Solar System Processing — and Rubin catalog QA generally —
@@ -354,8 +354,17 @@ stage. Do not turn that into a rate comparison between the stages:
 sustainable. Downstream, an append loads only parts absent from the ledger and
 fails rather than guessing if the ledger cannot account for the table. Upstream,
 the flat per-visit exports do the same: a no-op nightly run over a 70,946-group
-product takes **24 s**, and a real append of 940,680 refs / 118.5 M rows takes
-about **9 min**.
+product takes **24 s**, and a real append (940,680 refs / 118.5 M rows) costs
+**minutes when the input artifacts are resident in the storage cache, and
+roughly 45x more when they are not** (measured ~3,900 vs ~90 artifacts/s on the
+same product and collections; the same one-era rebuild took 7,848 s cold and
+171 s warm). A nightly append over recently-written data is the warm case by
+construction — that is why nightly extension is cheap — but the flat rate does
+not transfer to re-reading old eras. For the many-small-file prompt products
+the conserved quantity is **artifacts per second**, not rows: two eras
+differing 31x in rows per artifact ran at nearly identical artifact rates, so
+per-file latency, not bandwidth, sets the pace there — the opposite regime
+from the bulk exports above.
 
 :::{important}
 HATS exports are one-off per release. There is no append mode for a HATS
