@@ -593,7 +593,7 @@ that make spatial searches fast — has no column in the VO-standard tables.
 no-op that still rederives the five tables, which makes `catalog publish` the
 repair for a damaged projection.
 
-**Publishing.** `mppdb catalog publish --schema X FILE` takes an on-node lock,
+**Publishing.** `mppdb catalog publish --schema X FILE` takes the publish lock,
 sha-verifies the store, diffs the incoming document against the stored one, refuses
 any removal without `--allow-remove`, writes the store with the rename pattern, and
 rederives. `catalog diff` and `catalog show` are read-only. Ingest publishes its
@@ -609,56 +609,253 @@ principal flags — which is what SCS uses to find a row identifier and to defin
 VERB=2. A rebuild therefore needs the flags re-applied as a deliberate step.
 :::
 
+**The locks.** Two `flock`s serialize writers: the publish lock, which a second
+publisher waits on, and a per-table ingest lock, which a second ingest of the
+same table is refused. A `flock` excludes only processes on one machine, so both
+are pinned to one designated ingest host: `MPPDB_INGEST_HOST=sdfiana031`, with
+the lock files in a local directory named by `MPPDB_LOCK_DIR`. Run from any
+other host, a publish or ingest refuses. This replaced the earlier rule, which
+compared the caller's host with the ClickHouse server's — a check that a server
+in a pod, whose host name is the pod's, can never pass.
+
 **How the service consumes it.** The service loads its catalog only from the store,
 at startup, and refuses to boot on a missing or sha-mismatched document rather than
 falling back to anything in its image. At runtime the catalog is one immutable
-object behind a single reference. `SIGHUP` rebuilds and rebinds it, and is
+object behind a single reference. A reload rebuilds and rebinds it, and is
 fail-safe: bad input keeps the previous catalog, logs loudly, and does not exit.
 Startup is deliberately the opposite, because there is nothing good to keep
-serving. `GET /catalog` reports the served generation and per-schema digests, which
+serving.
+
+**Reloads are automatic.** The service polls the store's `generation` every 60 s
+(`MPPDB_CATALOG_POLL_S`; 0 disables it) with one small query, and reloads when
+it changes. Poll errors keep the current catalog and are logged only when the
+state changes, so a long backend outage does not flood the log; a failed reload
+backs off before retrying. Measured on 2026-10-01, an unannounced publish was
+served 49 s later with no one touching the service. `SIGHUP` still triggers the
+same reload by hand. `GET /catalog` reports the served generation and per-schema digests, which
 is what makes publishing and reloading checkable instead of assumed.
 
 ### The deployments
 
-#### The backend node
+Everything below is the Phalanx application `river-next`, in the namespace of
+the same name, defined in `applications/river-next/`, except for what runs on
+the two SDF hosts. Argo CD currently deploys it from the Phalanx feature branch
+the failover work was built on, not from `main`.
 
-Everything that writes lives on `sdfiana035`, inside an apptainer sandbox whose
-root filesystem is a writable directory on WekaFS. It is here rather than in
-Kubernetes for the reason given under *Architecture*.
+#### ClickHouse
 
-**ClickHouse** runs there as a plain daemon. There is no systemd in the container
-and no automatic restart after a host reboot; bringing it back is a documented
-manual step, including a tmpfs directory that a reboot wipes. Its `user_files`
-staging directory is node-local scratch, visible under two names for one inode,
-which is why loaders may run inside or outside the container but never off-node.
+One server, ClickHouse **26.8 LTS**, from the upstream image pinned by digest.
+A long-term-support line gets a year of fixes on one version. The upgrade from
+26.6 is one-way: 26.6 may not read parts that 26.8 has written.
 
-**Ingest and catalog tooling** runs from a git checkout at
-`/root/projects/github.com/mjuric/mppdb`, kept on `main`, through its editable
-venv. `git pull` updates it. Configuration lives in `deploy/usdf/mppdb.toml` — the
-`[databases]` block is the authorization boundary, naming which ClickHouse
-databases are in play — plus committed scalars in `mppdb.env` and two git-ignored
-mode-600 secret files.
+| aspect | how |
+|---|---|
+| data | `…/river-next/clickhouse` on sdfdata Weka, mounted at `/var/lib/clickhouse` on both sides |
+| staging | `…/river-next/user-files` beside it, the server's `user_files_path` |
+| identity | the data directory's owning uid and gid, on both sides; the pod never chowns the volume |
+| pod | StatefulSet `river-next-clickhouse`, one replica, 64 CPU / 384 GiB, on the RSP node pool; `max_server_memory_usage` is 0.9 of the memory limit and `max_threads` is set to the CPU limit, since the container sees all 128 host cores |
+| failover host | `sdfiana032`, an unprivileged Apptainer instance of the same image, with the configuration exported byte-identical from the chart, including the pod's memory cap |
+| pod health | a liveness probe that reads a file ClickHouse writes in its data directory as well as pinging, so a lost mount restarts the container; a 30-minute startup allowance for metadata loading |
+| clients | a ClusterIP service for the front-end; a MetalLB `LoadBalancer` service on port 8123, on SLAC's private network, for ingest and direct clients on SDF hosts. The failover host serves the same ports itself |
+| users | `admin` (writers), `mppdb_ro` (the front-end), `ssp_xmatch` (a direct client with read access to `ssp`), all with password hashes from a Secret, plus a passwordless `default` restricted to localhost, which the `ssp.visit_exposure_dict` dictionary loads as |
+| switch | `clickhouse.backend: pod` (the default) or `external`. `external` scales the StatefulSet to zero, without deleting it or its claim, and points the front-end at `clickhouse.external.host`. Nothing else changes |
 
-#### The Phalanx application
+The data volume is a claim on the `sdf-data-rubin` storage class, whose PVs are a
+hostPath of the whole `/sdf/data/rubin` filesystem with a `Delete` reclaim
+policy. Its PV was patched to `Retain` seconds after it bound, and must stay so
+before anything deletes the claim.
 
-Provides the TAP API and the web UI. Reads the backend, owns no data. Defined in
-`applications/river/`, currently image `ghcr.io/mjuric/mppdb:sha-7570146`.
+**The discovery file.** Clients do not follow the server through forwarding:
+they change host name. Every switch rewrites the `river:` line of
+`/sdf/home/m/mjuric/.clickhouse.host`, one `name:host[:port]` per line, port
+8123 when absent, written atomically and leaving every other line as it is.
+`river-ch-failover start` writes `sdfiana032`'s name once the server answers;
+`point-to-pod` writes the LoadBalancer address only once the pod answers.
+Clients in containers must read the absolute path, since their `$HOME` differs.
+
+#### The ingest host
+
+Ingest and catalog publishes run on `sdfiana031`, as `admin` over HTTP to
+whichever side the discovery file names. The tooling runs from a checkout of the mppdb repository there, with
+`MPPDB_INGEST_HOST`, `MPPDB_LOCK_DIR` and `MPPDB_CLICKHOUSE_*` set in the
+environment, and `--user-files-root` naming the staging directory by its host
+path. The `MPPDB_CLICKHOUSE_*` variables override `deploy/usdf/mppdb.toml`, which
+still describes the previous single-host layout; its `[databases]` block remains
+the list of databases in play.
+
+#### The Phalanx front-end
+
+Provides the TAP API and the web UI. Reads ClickHouse, owns no catalog data.
+Currently image `ghcr.io/mjuric/mppdb:sha-f0d957e`.
 
 | aspect | how |
 |---|---|
 | auth | `GafaelfawrIngress`, scope `read:tap`; the service trusts the username header the ingress injects and creates the account on first sight |
-| path | `/river`, prefix stripped before the pod; the app adds it back when generating URLs |
-| database credential | `mppdb_ro`: SELECT on `dp2`, `ppdb`, `ssp` and `TAP_SCHEMA`, plus `system.one` and `system.parts`. Nothing more — the grant matches the served set exactly |
-| state | 20 GiB `wekafs` ReadWriteOnce volume at `/data` |
+| path | `/river`, prefix stripped before the pod; the app adds it back when generating URLs. The chart's default is `/river-next`, the validation path |
+| database credential | `mppdb_ro`: SELECT on `dp2`, `ppdb`, `ssp` and `TAP_SCHEMA`, `dictGet` on `ssp.visit_exposure_dict`, plus `system.one` and `system.parts`. Nothing more — the grant matches the served set exactly |
+| state | 20 GiB `wekafs` ReadWriteOnce volume at `/data`, and a separate 2 TiB volume for async results |
 | replicas | exactly one, `strategy: Recreate` — the state engine is single-writer and two writers corrupt `state.db` |
-| secrets | hand-created: `river` (database credential) and `river-pull` (registry token) |
-| catalog | loaded from the store at startup, refreshed by `SIGHUP`, never by redeploy |
+| secrets | hand-created: `river-next` (database credential), `river-next-pull` (registry token) and `river-next-clickhouse` (the ClickHouse users' password hashes) |
+| catalog | loaded from the store at startup, then reloaded whenever its 60 s poll sees the store's generation change |
 
 :::{important}
-The two secrets are hand-created because this deployment has no Vault access yet.
-The chart has a `useVaultSecret` flag; turning it on produces a `VaultSecret` of the
-same name, so the swap changes nothing else.
+The secrets are hand-created because this deployment has no Vault access yet.
+Each template has a `useVaultSecret` flag; turning it on produces a `VaultSecret`
+of the same name, so the swap changes nothing else. The failover host reads the
+same password hashes from a mode-600 file outside the repository.
 :::
+
+### Failover and fencing
+
+The pod and `sdfiana032` run one server on one data directory. Two servers on
+one ClickHouse data directory corrupt it silently, so everything about the
+switch is built to make sure the other side is provably gone before a side
+starts. The design is the same shell code on both sides: a guard, and a wrapper
+around the server process. In the pod the guard is an init container and the
+wrapper is the container's command; on `sdfiana032` the wrapper is the Apptainer
+instance's process. Both are present whichever backend the chart selects, so a
+manual scale-up of the pod during a failover still meets the guard.
+
+**State on disk**, in the data directory:
+
+- **`.owner`**, one line, `<state> <ident> <UTC time>`, where `state` is `pod`,
+  `sdfiana032` or `released`. It is always written atomically. A missing file
+  means `pod`; an empty one is refused everywhere.
+- **Heartbeats**, `.heartbeat-pod` and `.heartbeat-sdfiana032`, touched every
+  30 s by the running side's wrapper for as long as its server lives, and
+  removed when it exits. A heartbeat older than 120 s is stale.
+- **The claim lock**, `.owner.lock/`, held only while a side checks the rules
+  and writes `.owner`. `mkdir` is atomic from both the NFS and the native
+  client. A `holder` file records who holds it, and is checked before and after
+  every write.
+
+**The wrapper** runs the guard, writes `<side> <ident>`, starts the server with
+a heartbeat beside it, and forwards SIGTERM. **Only a clean exit of the server,
+seen by the wrapper in the same container or instance, writes `released`.** A
+non-zero exit leaves the owner line naming that side, so that side alone may
+restart itself.
+
+**The guard's start rules**, all of which must hold:
+
+1. the owner line says `released`, or names this side — never the other side;
+2. the other side's heartbeat is absent or stale;
+3. the other side's server does not answer `GET /ping` within 3 s. This fails
+   closed: only a network failure counts as no answer, and any HTTP reply, even
+   an error, means alive;
+4. on the failover host only, the host's short name is `sdfiana032`.
+
+The claim then re-reads `.owner` 2 s after writing it and refuses unless it
+finds exactly the line it wrote. Nothing in the start path calls `kubectl`, so
+the failover host's start can run unattended.
+
+**Why stale signals never cross sides.** A server hung in a stalled NFS `open()`
+can resume writing when the mount recovers; on 2026-10-03 a fenced client's
+process lived on for five hours. A stale heartbeat and an unanswered ping are
+exactly what such a server looks like, so they are necessary for a cross-side
+start but never sufficient. The fence is `released`, and only a clean exit
+writes it. The two override paths — `river-ch-failover start --force-takeover`
+and `release-stale` — are interactive only, and require positive proof that the
+side named in `.owner` has no live server: for the pod, `kubectl` showing the
+StatefulSet at zero replicas **and** no pod at all, where a pod in
+`Terminating` counts as present; for `sdfiana032`, a process check over `ssh`
+showing no server or instance. An unreachable host is refused unless the
+operator confirms, after SDF does, that it is down. A pod stuck in `Terminating`
+on a stalled mount is not force-deleted: that removes the API object, not the
+process.
+
+The guard does not stop two servers of the *same* side, since rule 1 passes for
+both. The realistic case is a force-deleted `Terminating` pod whose process
+lives on beside its replacement, which is why force-deleting is ruled out.
+
+#### The rehearsal
+
+The switch was rehearsed on 2026-10-05, 03:44–04:28 UTC: pod mode, a switch to
+`sdfiana032`, the benchmarks above, and a switch back, with no override at any
+step.
+
+- **The first switch failed safe.** It came about 90 s after the pod had
+  started, while the server was still loading tables and scheduling merges. Its
+  shutdown ran past the 300 s grace period and the pod was SIGKILLed, so no
+  `released` was written; the owner line still named the pod and `start` would
+  have refused. Recovery was `backend: pod` again: the pod reclaimed the
+  directory under the same-side rule and was ready in 24 s, with the data
+  intact and no detached parts.
+- **A clean shutdown over NFS is slow.** With the server idle and merges
+  stopped, the second attempt shut down cleanly but took **586 s**, most of it in
+  shutting down storages. The grace period is now 1800 s, and a switch away from
+  the pod is preceded by letting the table loader finish, stopping merges and
+  TTL merges, and flushing logs.
+- **On `sdfiana032`** the server was serving 16 s after `start`; `/river` was
+  back after an outage of 10.5 minutes. The same server stopped cleanly there in
+  **7 s**, and the switch back to the pod was an outage of about 2 minutes.
+
+The front-end crash-loops while its ClickHouse is down, and recovers within
+about a minute of the server answering.
+
+The production switch followed on 2026-10-05 at 08:20 UTC. The pod had been
+settled for hours, shut down cleanly in about 10 s, and the outage was about
+70 s.
+
+### The move to Kubernetes
+
+Until October 2026 the server was ClickHouse 26.6 in an Apptainer instance on
+`sdfiana035`, and the front-end was a separate Phalanx application, `river`. The
+move put ClickHouse into the Phalanx application and upgraded it, without
+re-ingesting anything.
+
+**Approach.** ClickHouse parts are immutable: a merge or mutation writes a new
+part and removes the old one. Two servers can therefore share a part through
+hard links, and removing one link leaves the other intact — the mechanism
+`FREEZE` itself relies on. The new data directory was put on the same sdfdata
+filesystem as the old one so that links were possible.
+
+**Migration, 2026-10-03 (Pacific time).** With ingest paused and no unfinished
+mutations on the old server:
+
+| step | result |
+|---|---|
+| schema | 111 objects recreated on the new server from the old server's `SHOW CREATE`, in 12 s |
+| stop merges, freeze | merges stopped on the old server, then `FREEZE` of 82 tables in 3 minutes: **818 parts, 196,811,301,743 rows, 32.05 TiB**. The freeze manifest was the authoritative part list from then on |
+| link | from an SDF host, not a pod, since a hard link cannot cross the pod's two mounts: 440,461 large files hard-linked, 5,772 small per-part metadata files copied so no inode that a server might rewrite is shared; 9 min 52 s |
+| attach | merges stopped on the new server too, then all 818 parts attached in 24 minutes. Attaching renames a part on 26.8, so everything after this matched parts by `hash_of_all_files`. The old server's query logs went into a separate `system_2606` database |
+| verify | against the manifest, in 3 minutes: every part present by hash and no extras, row counts identical, the catalog store at the same generation, the dictionary loading |
+
+**Verification beyond the tool.** A black-box harness compared the two
+servers part by part and row by row (431 checks passing), ran a fixed query set
+through `/river` and the new front-end with identical results (12 of 12), and
+checked operations: both front-ends at the same catalog generation, the users
+authenticating, a real ingest with the new lock settings, the direct clients'
+results, and the liveness probe restarting a pod whose check was made to fail.
+The upgrade itself was reviewed against the 33 backward-incompatible changelog
+entries of 26.7 and 26.8, none of which affected River, and mppdb's live test
+suite passed against 26.8. The whole procedure had been rehearsed first on a
+scratch database on the real servers.
+
+The old server could not be made read-only for writers — its users are defined
+in XML, where SQL `REVOKE` does not apply — so instead nothing was published
+until cutover, and the full comparison ran once more immediately before it:
+429 checks passing and none failing, so no stray write had reached the old
+server.
+
+**Cutover, 2026-10-04, 21:20–21:36 UTC.** Both front-ends were scaled to zero,
+and the old front-end's user state was copied into the new one's volumes:
+`state.db`, checkpointed and integrity-checked, and the async spool — 218 files,
+44 GiB, in 8 min 18 s, every sha256 identical. That carried over 20 users, 34
+threads and 70 jobs. The old front-end's ingresses were removed and the
+new application took over `/river`. The outage was 16 minutes. The failover to
+`sdfiana032` was built after cutover, once the NFS findings came in.
+
+**Rollback and decommission.** The old server was kept, with merges stopped and
+the freeze in place, so that rollback was possible: scale the new front-end to
+zero, restore the old ingresses and scale the old front-end back up. Anything
+users did after cutover would be left behind, and anything written to the new
+server since would have to be redone on the old one, which cannot read parts
+26.8 writes. Decommissioning is in progress and goes in a fixed
+order: `UNFREEZE` on the old server first, because it needs the source tables
+and works only while that server runs; then the old `river` application, whose
+volumes were set to `Retain` before cutover; then the Apptainer instance. The
+old data directory and the leftover databases that were deliberately not
+migrated are deleted last, by hand.
 
 ### Operating the service
 
