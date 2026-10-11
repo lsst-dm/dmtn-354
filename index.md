@@ -39,8 +39,9 @@ people using the service; the second half is for people running it.
 The service runs at <https://usdf-rsp-dev.slac.stanford.edu/river>. Anyone who can
 log in to `usdf-rsp-dev` can query it.
 
-It is a pilot. It runs on one node, has no replication and no backups, and does
-not come back on its own after a host reboot. It is in real use anyway. This note
+It is a pilot. Its database is one ClickHouse server with no replication and no
+backups, and in its current placement it does not come back on its own after a
+host reboot. It is in real use anyway. This note
 describes what is deployed, not what is planned.
 
 **Part I — Using the service** covers what is in the database and how to query
@@ -189,16 +190,19 @@ not do, use ADQL with `CONTAINS`.
 
 ### Things to know
 
-**This is a pilot on one node.** If the host reboots, ClickHouse does not come
-back on its own and every query fails until someone restarts it by hand. There is
-no replication and no backup.
+**This is a pilot on one database server.** If the host it runs on reboots,
+ClickHouse does not come back on its own and every query fails until someone
+restarts it by hand. There is no replication and no backup. The server can be
+moved between two hosts, and each move is an outage of a few minutes during
+which queries fail.
 
 **Who to ask.** The service is run by the Solar System Pipelines group; mjuric
 owns it today. Report a wrong column, a missing table or an outage there, or file
 an issue against the mppdb repository.
 
-`ssp.SubmittableSources`, a view over all eleven `ssp` tables, is not advertised
-over TAP yet.
+`ssp.SubmittableSources` is a view over the `ssp` tables, and is served over TAP
+like any other table. Its spatial pruning is weak, so a small cone on it takes
+seconds rather than the 0.1 s of the base tables.
 
 ## Part II — Operations and internals (DRAFT)
 
@@ -221,47 +225,69 @@ operator rather than reproducing it.
 
 ### Architecture
 
-Two parts:
+River is one [Phalanx](https://phalanx.lsst.io/) application, `river-next`, on
+`usdf-rsp-dev`, plus two SDF hosts outside the cluster:
 
-- a **backend** on `sdfiana035`: the ClickHouse server, the ingest tooling, and
-  the catalog store. All writes happen here.
-- the **service**: the `river` [Phalanx](https://phalanx.lsst.io/) application on
-  `usdf-rsp-dev`. It provides
-  the TAP API and the web UI. It reads the backend and owns no data.
+- the **front-end**: the TAP API and the web UI, served at `/river`. It reads
+  ClickHouse and owns no catalog data.
+- the **ClickHouse server**: version 26.8 LTS, one server, with its data
+  directory on SDF's sdfdata Weka filesystem. The chart defines it as a
+  single-replica StatefulSet. It currently runs instead on **`sdfiana032`**, the
+  same image, configuration and data directory, reached through the native Weka
+  client. The pod is the fallback. A chart value, `clickhouse.backend: pod |
+  external`, says which side the front-end uses.
+- the **ingest host**, **`sdfiana031`**: every ingest and catalog publish runs
+  there, from SDF, never in the cluster.
 
 ```{mermaid}
 flowchart TB
-  subgraph BACKEND["backend · sdfiana035 · apptainer sandbox"]
-    ING["ingest: parquet / HATS / tapdump<br/>publishes data, then catalog"]
-    CH[("ClickHouse 26.6<br/>dp2 · ppdb · ssp<br/>TAP_SCHEMA + registries")]
-    ING --> CH
-  end
-  SVC["river Phalanx app · usdf-rsp-dev<br/>/river"]
   U["users: web UI · TOPCAT · pyvo"]
-  CH -- "read-only, mppdb_ro" --> SVC
-  SVC --> U
+  subgraph RSP["usdf-rsp-dev · Phalanx app river-next"]
+    FE["River front-end<br/>/river"]
+    POD[("ClickHouse 26.8 pod<br/>fallback, 0 replicas")]
+  end
+  N032[("ClickHouse 26.8 · sdfiana032<br/>serving")]
+  subgraph WEKA["sdfdata Weka"]
+    DATA[("data directory<br/>.owner · heartbeats")]
+    UF["user-files staging"]
+  end
+  ING["ingest + catalog publish<br/>sdfiana031"]
+  U --> FE
+  FE -- "read-only, mppdb_ro" --> N032
+  FE -. "backend: pod" .-> POD
+  N032 -- "native Weka client" --> DATA
+  POD -. "NFS 4.1 via Weka gateway" .-> DATA
+  ING -- "admin, HTTP 8123" --> N032
+  ING -- "Parquet shards" --> UF
 ```
 
-**Why it is split.** The service runs on Phalanx because Phalanx supplies what a
-user-facing service needs: [Gafaelfawr](https://gafaelfawr.lsst.io/) authentication,
-container builds, ingress and
-TLS, secret management, and a reviewable deploy path. The backend cannot run there.
-WekaFS reaches this Kubernetes environment over NFS, and NFS is too slow for the
-data path. So the backend runs on a node where WekaFS is mounted natively, and the
-service reaches it over the network.
+**Why the server sits outside its own pod.** Phalanx supplies what a
+user-facing service needs: [Gafaelfawr](https://gafaelfawr.lsst.io/)
+authentication, container builds, ingress and TLS, secret management, and a
+reviewable deploy path. ClickHouse was moved into the same application so that
+it, too, is declared in the chart and restarts itself. But the cluster's nodes
+reach sdfdata over NFS 4.1 through the Weka gateway, not through the native Weka
+client. Over NFS, steady-state reads are as fast as the previous server's on its
+native mount, or faster, while the first access to each file is slow, an occasional `open()` hangs
+for minutes, and a clean shutdown takes about ten minutes (see *Storage path: NFS
+against native Weka*). So the same server runs on an SDF host with the native
+client, and the pod stays ready to take over. Both use one data directory, and
+the fencing described in *Failover and fencing* makes sure only one of them
+runs.
 
 :::{important}
-The ideal deployment is one containerized application under
-[Argo CD](https://argo-cd.readthedocs.io/en/stable/) — server,
-ingest and service together, with no node to maintain by hand. Filesystem
-performance in Kubernetes is what blocks it, not anything about mppdb. Until that
-changes, the node is necessary and should not be moved into the cluster. See
-*What production would require*.
+The ideal deployment is the one the chart already describes: everything under
+[Argo CD](https://argo-cd.readthedocs.io/en/stable/), with no host to maintain
+by hand. What blocks it is the storage path, not anything about mppdb: the pod
+needs native Weka access to sdfdata, through a CSI storage class or a native
+client on the cluster's nodes. Until then the failover host is the better place
+for the server. See *What production would require*.
 :::
 
-The unit of operation between the two parts is the catalog: a publish on the
-backend changes what the service should serve, and the service picks it up only
-when reloaded — see *Operating the service*.
+The unit of operation between ingest and the front-end is the catalog: a
+publish on the ingest host changes what the service should serve, and the
+front-end picks it up on its next poll of the store, within about a minute —
+see *Operating the service*.
 
 ### The data: provenance and lifecycle
 
@@ -307,15 +333,22 @@ data path.)
 
 **Cadence.** `dp2` and `ppdb` are static. `ssp` arrives in bursts, whenever a
 nightly append actually appends, plus occasional metadata-only catalog publishes.
-Every load runs on `sdfiana035`, because staging goes through the ClickHouse
-server's node-local `user_files` directory.
+Every load runs on the designated ingest host, `sdfiana031`. Ingest writes
+Parquet shards into a staging directory on sdfdata, beside the data directory,
+and ClickHouse reads them with `file()`: the same directory is the server's
+`user_files_path` on either side, and the loader names it by its host path with
+`--user-files-root`.
 
-**Adding a database to this service** is two ordered steps and a reload:
-`GRANT SELECT ON <db>.* TO mppdb_ro` on the backend, then a `databases.<db>`
-entry in the chart. The `[databases]` block is the authorization boundary — a
-database absent from it is not served, whatever the store holds — and doing the
-chart half without the grant leaves the service configured for a database it
-cannot read.
+**Adding a database to this service** is two chart changes: a `SELECT` grant
+for `mppdb_ro` in the chart's ClickHouse user definitions, and a
+`databases.<db>` entry for the front-end. The users and their grants are
+declared in the chart, not issued as SQL on the server. The `[databases]` block
+is the authorization boundary — a database absent from it is not served,
+whatever the store holds — and doing the front-end half without the grant leaves
+the service configured for a database it cannot read. While the server runs on
+the failover host, its configuration is a snapshot exported from the chart, so a
+grant change also needs a fresh export, which in turn needs the server stopped
+(see *Maintaining and upgrading*).
 
 ### Ingest and query performance
 
@@ -406,7 +439,8 @@ key its queries filter by, so the engine reads a slice rather than scanning.
   search on `ssp` is a full scan, which is correct but slow.
 
 Measured through the deployed service against `dp2`, 2026-08-24, at catalog
-generation 20. Each query was run twice; both timings are given, because the gap
+generation 20, when the server was the previous one on `sdfiana035` (see
+*Storage path* below for how the current server compares). Each query was run twice; both timings are given, because the gap
 between them is the point.
 
 | query | first | repeat | rows |
@@ -459,6 +493,85 @@ of the `OVERFLOW` truncation the service reports as success. The harness runs on
 
 Full method, ids and reproduction details are in the control directory's
 `notes/2026-08-24-mppdb-tap-measurements.md`.
+
+#### Storage path: NFS against native Weka
+
+The same data has now been served by three servers, which isolates what the
+storage path costs:
+
+- **old**: ClickHouse 26.6 on `sdfiana035`, the previous server, with sdfdata
+  mounted natively. Measured 2026-10-04.
+- **pod**: ClickHouse 26.8 in the `river-next` pod, reaching sdfdata over NFS 4.1
+  through the Weka gateway. Measured 2026-10-04.
+- **sdfiana032**: the same 26.8 binary and configuration, with sdfdata mounted
+  natively. Measured 2026-10-05.
+
+All three read the same parts — the migration hard-linked them — with the same
+queries and cone centres. Queries went directly to ClickHouse from `sdfiana031`,
+not through TAP, one at a time, with `max_threads=64`, the query cache off and
+output discarded. Timings are server-side medians in seconds. "Cold" means every
+ClickHouse cache was dropped and each cone used a fresh sky position; the
+operating system's page cache could not be dropped from the pod.
+
+| query | mode | old | pod (NFS) | sdfiana032 (native) |
+|---|---|---|---|---|
+| `dp2.Source` `GROUP BY band` (17.6 B rows) | cold / warm | 50.2 / 27.5 | 27.1 / 12.8 | 19.3 / 10.7 |
+| `dp2.ForcedSource` aggregate (44.7 B rows) | cold / warm | 43.4 / 43.2 | 90.0 / 17.3 | 30.8 / 15.8 |
+| `ssp.source_daytime` aggregate (43.5 B rows) | cold / warm | 69.9 / 69.3 | 87.4 / 65.8 | 51.7 / 25.5 |
+| `dp2.Object` scan, three magnitude cuts | cold / warm | 8.8 / 1.73 | 1.9 / 1.02 | 2.3 / 0.88 |
+| `dp2.Object` 10° colour-cut cone | cold / warm | 16.8 / 0.42 | 0.94† / 0.28 | 3.8 / 0.24 |
+| **`dp2.Object` 1° cone, 50 columns** | cold / warm | 0.92 / 0.11 | **56.7** / 0.16 | 0.61 / 0.11 |
+| `DiaSource` × `DiaObject` join, 1° cone | cold / warm | 1.31 / 0.17 | 2.72 / 0.19 | 0.57 / 0.15 |
+| `ppdb.DiaSource` point lookup by id | cold / warm | 0.14 / 0.088 | 0.26 / 0.185 | 0.14 / 0.09 |
+| `ssp.SubmittableSources` full scan, 16 columns (93.8 B rows, 7.96 TiB) | cold | 1327.7 | 959.1 | 851.8 |
+| id lookup on `ssp.SubmittableSources`, 1,400 ids (client wall time) | cold / warm | 2.0–3.0 / 1.9 | 2.7–4.0 / 2.05 | 1.9–3.1 / 1.7 |
+| clean server shutdown | | — | 586 (idle) | 7 |
+
+† The pod's colour-cut columns were already in its node's page cache from
+earlier use.
+
+Three findings follow.
+
+**Over NFS, the cost falls on the first access to each file.** The 1° cone reads
+50 `dp2.Object` columns that nothing had touched since a restart. In the pod it
+took about 57 s on each of three runs, to read 14 MiB through 432 file opens,
+with 562 s of thread time spent waiting to load marks; the previous server on
+its native mount took 0.92 s. Once a file has been read it is fast. The
+first-access case appeared in real use too: the first validation query from the
+solar-system tooling after cutover took 42.9 s, with 2,599 file opens for
+154 MiB, against 0.9 s for the identical rerun. Wide tables are where this
+hurts, because their rarely-read columns pay it again on every node and after
+every page-cache eviction.
+
+**Over NFS, an `open()` occasionally hangs for minutes.** On 2026-10-04, after
+cutover, one ClickHouse thread sat in `openat()` from 22:00:44 to 22:13:52 UTC,
+blocked in the kernel's NFS client (`nfs_set_open_stateid_locked`), and every
+`dp2.Object` read waited behind it until all were released in the same second.
+Of that query's 788 s, 11.1 s was disk reading. The user's async query hit the
+front-end's 300 s timeout and failed. A second stall at 23:35 that day held a
+planning-only `EXPLAIN ESTIMATE` for 8 minutes, again in a single NFS open, with
+16,018 file opens and 4.5 s of real disk time.
+
+**Native Weka removes both.** On `sdfiana032` the same 26.8 server ran the cold
+wide cone in 0.61 s against 56.7 s, was the fastest of the three on every large
+scan, and finished the full `SubmittableSources` scan in 851.8 s
+(9.6 GiB/s) against 959.1 s in the pod and 1327.7 s on the previous server. The
+hardware is not identical — the pod runs on an EPYC 7702P inside a 64-core,
+384 GiB limit, while `sdfiana032` is an EPYC 7713P with 128 cores, 503 GiB and
+no limit, shared with other work — so part of the advantage may be the CPU.
+The first-access penalty is not a hardware effect: the pod's warm timings are
+close to the native host's. This is why the server runs on `sdfiana032`, and
+why native Weka access from the cluster is the fix to pursue.
+
+Steady-state performance over NFS is not the problem: warm, the pod was as fast
+as the previous server or faster, 0.4–1.0 times its time on the large scans.
+Point lookups carry about 0.1 s more per query in the pod with no disk wait,
+which is CPU, version or configuration rather than storage.
+
+Full method and raw data are in the control directory's
+`notes/2026-10-04-river-old-vs-new-benchmark.md` and
+`notes/2026-10-05-river-failover-rehearsal.md`.
+
 
 ### The catalog store
 
