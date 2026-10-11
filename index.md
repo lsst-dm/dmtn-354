@@ -257,7 +257,7 @@ flowchart TB
   FE -. "backend: pod" .-> POD
   N032 -- "native Weka client" --> DATA
   POD -. "NFS 4.1 via Weka gateway" .-> DATA
-  ING -- "admin, HTTP 8123" --> N032
+  ING -- "writes, HTTP" --> N032
   ING -- "Parquet shards" --> UF
 ```
 
@@ -339,9 +339,9 @@ and ClickHouse reads them with `file()`: the same directory is the server's
 `user_files_path` on either side, and the loader names it by its host path with
 `--user-files-root`.
 
-**Adding a database to this service** is two chart changes: a `SELECT` grant
-for `mppdb_ro` in the chart's ClickHouse user definitions, and a
-`databases.<db>` entry for the front-end. The users and their grants are
+**Adding a database to this service** is two chart changes: a read grant for
+the front-end's account in the chart's ClickHouse user definitions, and a
+`databases.<db>` entry for the front-end. Accounts and their grants are
 declared in the chart, not issued as SQL on the server. The `[databases]` block
 is the authorization boundary — a database absent from it is not served,
 whatever the store holds — and doing the front-end half without the grant leaves
@@ -631,7 +631,9 @@ serving.
 it changes. Poll errors keep the current catalog and are logged only when the
 state changes, so a long backend outage does not flood the log; a failed reload
 backs off before retrying. Measured on 2026-10-01, an unannounced publish was
-served 49 s later with no one touching the service. `SIGHUP` still triggers the
+served 49 s later with no one touching the service. That was the previous
+front-end, on the image this one runs; see *The ingest host* for its status
+here. `SIGHUP` still triggers the
 same reload by hand. `GET /catalog` reports the served generation and per-schema
 digests, which is what makes publishing and reloading checkable instead of
 assumed.
@@ -640,8 +642,7 @@ assumed.
 
 Everything below is the Phalanx application `river-next`, in the namespace of
 the same name, defined in `applications/river-next/`, except for what runs on
-the two SDF hosts. Argo CD currently deploys it from the Phalanx feature branch
-the failover work was built on, not from `main`.
+the two SDF hosts. Argo CD deploys it from Phalanx `main`.
 
 #### ClickHouse
 
@@ -657,8 +658,8 @@ A long-term-support line gets a year of fixes on one version. The upgrade from
 | pod | StatefulSet `river-next-clickhouse`, one replica, 64 CPU / 384 GiB, on the RSP node pool; `max_server_memory_usage` is 0.9 of the memory limit and `max_threads` is set to the CPU limit, since the container sees all 128 host cores |
 | failover host | `sdfiana032`, an unprivileged Apptainer instance of the same image, with the configuration exported byte-identical from the chart, including the pod's memory cap |
 | pod health | a liveness probe that reads a file ClickHouse writes in its data directory as well as pinging, so a lost mount restarts the container; a 30-minute startup allowance for metadata loading |
-| clients | a ClusterIP service for the front-end; a MetalLB `LoadBalancer` service on port 8123, on SLAC's private network, for ingest and direct clients on SDF hosts. The failover host serves the same ports itself |
-| users | `admin` (writers), `mppdb_ro` (the front-end), `ssp_xmatch` (a direct client with read access to `ssp`), all with password hashes from a Secret, plus a passwordless `default` restricted to localhost, which the `ssp.visit_exposure_dict` dictionary loads as |
+| clients | an in-cluster service for the front-end, and a MetalLB `LoadBalancer` address on SDF's internal network for ingest and direct clients on SDF hosts. On the failover host the server is reachable on that host's own name |
+| accounts | declared in the chart, with password hashes from a Secret: one for writers, a read-only one for the front-end, and one for a direct read client |
 | switch | `clickhouse.backend: pod` (the default) or `external`. `external` scales the StatefulSet to zero, without deleting it or its claim, and points the front-end at `clickhouse.external.host`. Nothing else changes |
 
 The data volume is a claim on the `sdf-data-rubin` storage class, whose PVs are a
@@ -668,21 +669,26 @@ before anything deletes the claim.
 
 **The discovery file.** Clients do not follow the server through forwarding:
 they change host name. Every switch rewrites the `river:` line of
-`/sdf/home/m/mjuric/.clickhouse.host`, one `name:host[:port]` per line, port
-8123 when absent, written atomically and leaving every other line as it is.
+`/sdf/home/m/mjuric/.clickhouse.host`, one `name:host[:port]` per line, the
+default port when absent, written atomically and leaving every other line as it is.
 `river-ch-failover start` writes `sdfiana032`'s name once the server answers;
 `point-to-pod` writes the LoadBalancer address only once the pod answers.
 Clients in containers must read the absolute path, since their `$HOME` differs.
 
 #### The ingest host
 
-Ingest and catalog publishes run on `sdfiana031`, as `admin` over HTTP to
-whichever side the discovery file names. The tooling runs from a checkout of the
+Ingest and catalog publishes run on `sdfiana031`, over HTTP to whichever side
+the discovery file names. The tooling runs from a checkout of the
 mppdb repository there, with `MPPDB_INGEST_HOST`, `MPPDB_LOCK_DIR` and `MPPDB_CLICKHOUSE_*` set in the
 environment, and `--user-files-root` naming the staging directory by its host
 path. The `MPPDB_CLICKHOUSE_*` variables override `deploy/usdf/mppdb.toml`, which
 still describes the previous single-host layout; its `[databases]` block remains
 the list of databases in play.
+
+Ingest resumed after cutover: 728 inserts between the 2026-10-05 switch to
+`sdfiana032` and 2026-10-08. There has been no catalog publish since 2026-10-01
+(generation 40), so the front-end's automatic reload has not yet been exercised
+on this deployment. Verifying it with the first publish is pending.
 
 #### The Phalanx front-end
 
@@ -693,17 +699,17 @@ Currently image `ghcr.io/mjuric/mppdb:sha-f0d957e`.
 |---|---|
 | auth | `GafaelfawrIngress`, scope `read:tap`; the service trusts the username header the ingress injects and creates the account on first sight |
 | path | `/river`, prefix stripped before the pod; the app adds it back when generating URLs. The chart's default is `/river-next`, the validation path |
-| database credential | `mppdb_ro`: SELECT on `dp2`, `ppdb`, `ssp` and `TAP_SCHEMA`, `dictGet` on `ssp.visit_exposure_dict`, plus `system.one` and `system.parts`. Nothing more — the grant matches the served set exactly |
+| database credential | `mppdb_ro`, read-only and limited to what the service serves |
 | state | 20 GiB `wekafs` ReadWriteOnce volume at `/data`, and a separate 2 TiB volume for async results |
 | replicas | exactly one, `strategy: Recreate` — the state engine is single-writer and two writers corrupt `state.db` |
-| secrets | hand-created: `river-next` (database credential), `river-next-pull` (registry token) and `river-next-clickhouse` (the ClickHouse users' password hashes) |
+| secrets | hand-created: the database credential, the registry token, and the ClickHouse accounts' password hashes |
 | catalog | loaded from the store at startup, then reloaded whenever its 60 s poll sees the store's generation change |
 
 :::{important}
 The secrets are hand-created because this deployment has no Vault access yet.
 Each template has a `useVaultSecret` flag; turning it on produces a `VaultSecret`
 of the same name, so the swap changes nothing else. The failover host reads the
-same password hashes from a mode-600 file outside the repository.
+same material from a protected file outside the repository.
 :::
 
 ### Failover and fencing
@@ -846,17 +852,16 @@ threads and 70 jobs. The old front-end's ingresses were removed and the
 new application took over `/river`. The outage was 16 minutes. The failover to
 `sdfiana032` was built after cutover, once the NFS findings came in.
 
-**Rollback and decommission.** The old server was kept, with merges stopped and
-the freeze in place, so that rollback was possible: scale the new front-end to
-zero, restore the old ingresses and scale the old front-end back up. Anything
-users did after cutover would be left behind, and anything written to the new
-server since would have to be redone on the old one, which cannot read parts
-26.8 writes. Decommissioning is in progress and goes in a fixed
-order: `UNFREEZE` on the old server first, because it needs the source tables
-and works only while that server runs; then the old `river` application, whose
-volumes were set to `Retain` before cutover; then the Apptainer instance. The
-old data directory and the leftover databases that were deliberately not
-migrated are deleted last, by hand.
+**Rollback and decommission.** The old server was kept for a week after cutover,
+with merges stopped and the freeze in place, so that rollback stayed possible.
+Decommissioning followed on 2026-10-11, in a fixed order: `UNFREEZE` of the
+migration snapshot first, because it needs the source tables and works only
+while the old server runs; then the old ClickHouse on `sdfiana035` was stopped
+for good. The same day the previous deployment's own front-end was retired, and
+the old `river` Argo CD application was deleted; its volumes, set to `Retain`
+before cutover, were kept. `river-next` was then merged into Phalanx `main`, and
+deploys from there. Still to come: deleting the old data directory and the
+databases that were deliberately not migrated, by hand.
 
 ### Operating the service
 
@@ -1066,10 +1071,6 @@ A direct client fails to connect from an SDF host
   discovery file — or its traffic is going to SDF's HTTP proxy, which cannot reach
   either address. Add both to `no_proxy`.
 
-Syncing the old `river` application breaks `/river`
-: It recreates the old front-end's ingresses, which collide with the current
-  application's. It is not auto-synced; leave it alone until it is removed.
-
 The service refuses to start, complaining about the catalog
 : By design there is no fallback: a missing, empty, unparseable, duplicated or
   sha-mismatched document aborts startup. Publish the catalog, then start.
@@ -1123,29 +1124,20 @@ Ordered by how much they should worry a new owner.
    reach the pod. A NetworkPolicy is applied and correct, but an in-cluster pod
    bypassed it and forged the header. External access is still gated by Rubin SSO,
    so the exposure is pod-to-pod inside the cluster — acceptable for dev, a blocker
-   for production. Separately, ClickHouse's port 8123 is reachable from SLAC's
-   private network with no source restriction; passwords are the only control.
-5. **The trust model for writers.** Ingest, catalog publishes and administration
-   all use one shared account, `admin`, which holds every privilege, including
-   over the catalog store. The passwordless `default` user, which the dictionary
-   needs, is restricted to localhost. In the pod that means the pod itself. The
-   Apptainer instance on `sdfiana032` does not have its own network namespace,
-   so there localhost is the host, and being on the node is again a credential
-   — now on a shared interactive node. Production needs per-writer accounts with
-   scoped grants, and a `default` user nothing else can reach.
-6. **Secrets are hand-created**, both in the cluster and as a file on the
+   for production. The ClickHouse server itself is reachable from SDF's internal
+   network, behind its accounts' passwords.
+5. **Secrets are hand-created**, both in the cluster and as a file on the
    failover host, pending Vault access.
-7. **One service replica.** `state.db` is single-writer, so the service does not
+6. **One service replica.** `state.db` is single-writer, so the service does not
    scale horizontally without upstream work.
-8. **Catalog updates are partly manual.** `ingest-tapdump` does not publish to the
+7. **Catalog updates are partly manual.** `ingest-tapdump` does not publish to the
    store, so `ppdb` catalog updates are hand-run. `catalog publish` has no
    compare-and-set staleness guard, so a stale local document can revert curated
    metadata; operator convention is the current mitigation.
-9. **The move is not finished.** The old server and its data directory still
-   exist until decommissioning completes; afterwards the old data directory and
-   the databases deliberately left behind are to be deleted. Argo CD deploys
-   `river-next` from a Phalanx feature branch rather than `main`.
-10. **Single-operator knowledge.** The mppdb repository's runbooks are good, but
+8. **The move is not finished.** Still to do: deleting the old data directory
+   and the databases deliberately left behind; scoped accounts for writers;
+   lingering on the failover host; and the documentation.
+9. **Single-operator knowledge.** The mppdb repository's runbooks are good, but
    this note is the first document an outside operator could start from.
 
 ### What production would require
@@ -1166,7 +1158,7 @@ A handover checklist, not a plan of record.
    the served databases.
 3. **Unattended restart** of ClickHouse wherever it runs: lingering on the
    failover host, or the pod as the home.
-4. **Per-writer ClickHouse accounts**, replacing the shared `admin`.
+4. **Scoped ClickHouse accounts for each writer.**
 5. **Confirm NetworkPolicy enforcement**, or replace the service's header trust
    with token verification it performs itself.
 6. **Vault-managed secrets**, replacing the hand-created ones.
